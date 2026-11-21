@@ -37,6 +37,7 @@ from .dettato.grouper.model import NoteNet
 from .dettato.pipeline import MIN_END_S, HOST_BUF_AFTER_S, Track
 from .dettato.transcriber.core import Transcriber
 from .dettato.transcriber.model import LaneNet
+from .abc_score import tracks_to_abc
 from .piano_roll import render_piano_roll
 from .track_io import audio_to_mono, filter_min_velocity, make_tracks_payload, summary_json, write_midi
 
@@ -593,6 +594,89 @@ class DettatoInfo:
         return (summary_json(tracks),)
 
 
+class DettatoToYuE2ABC:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "tracks": ("DETTATO_TRACKS",),
+                "mode": (["melody", "full"], {"default": "melody"}),
+                "melody_track": ("STRING", {"default": ""}),
+                "ins_track": ("STRING", {"default": ""}),
+                "key": ("STRING", {"default": "auto"}),
+                "tempo": ("INT", {"default": 0, "min": 0, "max": 500}),
+                "meter": (["4/4", "3/4", "6/8", "7/8"], {"default": "4/4"}),
+                "grid": (["1/16", "1/32"], {"default": "1/16"}),
+                "octave": (["auto", "-2", "-1", "0", "1", "2"], {"default": "auto"}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("abc_score", "abc_summary")
+    FUNCTION = "convert"
+    CATEGORY = "music/Dettato"
+    DESCRIPTION = (
+        "Convert the transcription to the native two-voice ABC score that ComfyUI's built-in "
+        "YuE2 Generate Music node renders: wire the abc_score output to that node's abc input and "
+        "YuE2 regenerates the song from your transcribed melody. mode: 'melody' (the default and "
+        "the recommended cover path) leaves the score chord-free, so YuE2 keeps your melody and "
+        "writes its own accompaniment; 'full' derives chord symbols from the non-melody tracks. "
+        "melody_track: the exact name of the track to use as the melody (empty = pick the most "
+        "lead-like pitched track automatically - a voice/vocal track wins, a bass track is never "
+        "picked); ins_track: a second pitched track for the Ins voice (empty = the busiest "
+        "remaining line above G3 that is not a bass; 'none' = the Ins voice is rests). key: 'auto' "
+        "runs key-finding on the melody, or a standard key such as 'Am' or 'Db'; tempo: 0 fits a "
+        "grid to the onsets (drum hits weighted double), or a fixed BPM. octave: 'auto' moves a "
+        "line by whole octaves into the C4..A#5 window when its middle pitch lies outside it, "
+        "because YuE2 sings the octave it is given; an integer transposes both lines. The output "
+        "is the exact dialect YuE2 and SheetSage2 use, so you can inspect it, correct a few notes "
+        "in any text editor and feed the edited text to YuE2. See the README's YuE2 section."
+    )
+
+    def convert(self, tracks: dict, mode: str, melody_track: str, ins_track: str, key: str,
+                tempo: int, meter: str, grid: str, octave: str = "auto"):
+        meta = {}
+        abc = tracks_to_abc(
+            tracks["tracks"], tracks["seconds"], mode=mode, melody_track=melody_track,
+            ins_track=ins_track, key=key, tempo=tempo, meter=meter, grid=grid, octave=octave,
+            out_meta=meta,
+        )
+        return (abc, json.dumps(meta, indent=2, sort_keys=True))
+
+
+class DettatoSaveABC:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "abc": ("STRING", {"default": "", "multiline": True}),
+                "filename_prefix": ("STRING", {"default": "dettato/abc"}),
+            }
+        }
+
+    RETURN_TYPES = ()
+    OUTPUT_NODE = True
+    FUNCTION = "save"
+    CATEGORY = "music/Dettato"
+    DESCRIPTION = (
+        "Write an ABC score to ComfyUI's output folder as <prefix>_XXXXX.abc (e.g. the "
+        "abc_score output of the To YuE2 ABC node), numbered so runs never overwrite each other. "
+        "Use it to keep the run's symbolic record, or to open the score in an editor, correct a "
+        "few notes and feed the edited text to YuE2."
+    )
+
+    def save(self, abc: str, filename_prefix: str):
+        folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
+            filename_prefix, folder_paths.get_output_directory(), 1, 1
+        )
+        # get_save_image_path counts PNGs only; count our own format to avoid overwrites.
+        counter = len(list(Path(folder).glob(f"{filename}_*.abc")))
+        path = Path(folder) / f"{filename}_{counter:05d}.abc"
+        path.write_text(abc, encoding="utf-8")
+        LOGGER.info("Dettato: wrote %s (%d chars).", path, len(abc))
+        return ()
+
+
 NODE_CLASS_MAPPINGS = {
     "DettatoLoader": DettatoLoader,
     "DettatoEvidence": DettatoEvidence,
@@ -602,6 +686,8 @@ NODE_CLASS_MAPPINGS = {
     "DettatoPianoRoll": DettatoPianoRoll,
     "DettatoSaveMIDI": DettatoSaveMIDI,
     "DettatoInfo": DettatoInfo,
+    "DettatoToYuE2ABC": DettatoToYuE2ABC,
+    "DettatoSaveABC": DettatoSaveABC,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DettatoLoader": "Dettato Loader",
@@ -612,4 +698,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DettatoPianoRoll": "Dettato Piano Roll",
     "DettatoSaveMIDI": "Dettato Save MIDI",
     "DettatoInfo": "Dettato Info",
+    "DettatoToYuE2ABC": "Dettato To YuE2 ABC",
+    "DettatoSaveABC": "Dettato Save ABC",
 }

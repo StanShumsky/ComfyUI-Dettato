@@ -16,6 +16,8 @@ def test_node_schemas(nodes):
     assert set(nodes.NODE_CLASS_MAPPINGS) == {
         "DettatoLoader", "DettatoEvidence", "DettatoGrouper", "DettatoDrums",
         "DettatoTranscribe", "DettatoPianoRoll", "DettatoSaveMIDI", "DettatoInfo",
+        "DettatoToYuE2ABC", "DettatoSaveABC",
+
     }
     for name, cls in nodes.NODE_CLASS_MAPPINGS.items():
         assert isinstance(cls.DESCRIPTION, str) and cls.DESCRIPTION

@@ -6,6 +6,10 @@ with vocals) and it writes a MIDI file with one track per instrument, each named
 instrument (73 classes, each with a General MIDI program), plus a drum track that covers drum
 kits and orchestral percussion, with timpani written at their pitch.
 
+The pack can also drive ComfyUI's built-in YuE2 song generator: the Dettato To YuE2 ABC node
+converts a transcription into the exact ABC score YuE2 renders, so a recording can be re-sung
+as a complete new song with vocals and accompaniment (see Covers with YuE2 below).
+
 It outperforms the next-best open transcriber (MuScriptor, 1.3 B parameters) at about 1/65th
 the size.
 
@@ -88,6 +92,60 @@ Transcribe node — save it with a text node when you need the JSON on disk.
 The transcription summary as a JSON string (the same content as the transcribe node's
 `info_json`), for branching or saving run metadata with another text node.
 
+### Dettato To YuE2 ABC
+Converts `tracks` into the native two-voice ABC score that ComfyUI's built-in YuE2 Generate
+Music node renders (ComfyUI v0.36.0 or later): wire the `abc_score` output to that node's
+`abc` input and YuE2 regenerates the song from the transcribed melody.
+- `mode`: `melody` (default, the recommended cover path) leaves the score chord-free, so YuE2
+  keeps the melody and writes its own accompaniment; `full` derives chord symbols from the
+  non-melody tracks.
+- `melody_track`: exact name of the track to use as the melody (empty = the most lead-like
+  pitched track is picked automatically — a voice/vocal track wins, a bass is never picked).
+  `ins_track`: a second pitched track for the Ins voice (empty = the busiest remaining line
+  above G3 that is not a bass; `none` = the Ins voice is rests).
+- `key`: `auto` runs key-finding on the melody, or a standard key such as `Am` or `Db`;
+  `tempo`: `0` fits a grid to the onsets (drum hits weighted double), or a fixed BPM.
+- `octave`: `auto` moves a line by whole octaves into the C4–A#5 window when its middle pitch
+  lies outside it, because YuE2 sings the octave it is given (the native cover scores live
+  there); an integer `±1..2` transposes both lines. Shifts are pitch-class-neutral, so the
+  key, chords and rhythm are untouched.
+- `meter` (`4/4`, `3/4`, `6/8`, `7/8`) and `grid` (`1/16`, `1/32`) set the bar shape and the
+  note resolution.
+- Outputs: `abc_score` (STRING) — the score text, editable in any text editor; `abc_summary`
+  (STRING) — JSON with the resolved key and BPM, the chosen tracks, the bar count, the number
+  of chord changes and the octave shifts applied.
+
+### Dettato Save ABC
+Writes an ABC score (e.g. the `abc_score` output above) to the output folder as
+`<prefix>_XXXXX.abc`, numbered per run. Use it to keep the run's symbolic record, or to open
+the score, correct a few notes and feed the edited text to YuE2.
+
+## Covers with YuE2
+
+YuE2 is a full-song generator built into ComfyUI (v0.36.0 or later): it turns a style prompt,
+lyrics and an optional symbolic score into a complete song with vocals and accompaniment. A
+Dettato transcription drives that score — the To YuE2 ABC node emits the native two-voice ABC
+dialect YuE2 and SheetSage2 use (fixed eight-line header, Vocal and Ins blocks of up to four
+bars, ties across barlines, full-measure `Z` rests), so the text can be inspected, corrected
+by hand and re-checked before generating:
+
+```
+Load Audio
+  -> Dettato chain: Loader -> Evidence -> Grouper -> Drums -> Transcribe
+  -> Dettato To YuE2 ABC (mode: melody)
+  -> YuE2GenerateMusic (abc input; plus style and lyrics)
+  -> Empty YuE2 Latent Audio (seconds) -> ... -> YuE2 VAE Decode -> Save Audio
+```
+
+In `melody` mode (the default) the score is chord-free: YuE2 keeps the transcribed melody and
+composes the arrangement, harmony and vocals around it — the cover path its own docs recommend
+for audio covers. Use `full` to seed the harmony from the transcription as well. Because the
+transcription is performance MIDI, the score keeps the recording's timing; set `key` and
+`tempo` by hand when you want a strict grid. The melody voice is the most lead-like track
+(a vocal track wins), the Ins voice is the busiest remaining line above G3, and `octave`
+keeps both lines in the register YuE2 sings best in. The YuE2 nodes are built in — nothing
+extra to install, just keep ComfyUI up to date.
+
 ## Example workflows
 
 Drag into ComfyUI (or use Workflow → Open):
@@ -95,6 +153,9 @@ Drag into ComfyUI (or use Workflow → Open):
 - [example_workflows/audio2midi.json](example_workflows/audio2midi.json) — Load Audio → Loader →
   Evidence → Grouper → Drums → Transcribe → Piano Roll → Preview Image, plus Save MIDI. Keep
   ComfyUI up to date for the built-in audio nodes.
+
+For a YuE2 cover, extend the same graph: Transcribe → Dettato To YuE2 ABC →
+the `abc` input of a built-in YuE2GenerateMusic node (see Covers with YuE2).
 
 ## Notes
 

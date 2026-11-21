@@ -18,6 +18,12 @@ float32 precision, with no precision setting to configure.
 
 ## Install
 
+From the ComfyUI-Manager: *Manager → Install Custom Nodes* → search for **ComfyUI-Dettato** →
+Install; it is listed in the registry as `shumsky/ComfyUI-Dettato`, and Manager installs its
+requirements as well.
+
+Or clone it manually:
+
 ```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/StanShumsky/ComfyUI-Dettato

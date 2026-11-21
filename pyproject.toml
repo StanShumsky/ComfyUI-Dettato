@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-dettato"
-description = "KobiMusic Dettato multi-instrument audio-to-MIDI nodes: a custom loader for the four 28.1M-parameter stage models (transcriber, evidence repairer, grouper, drums) loaded at their released fp32 precision, plus piano-roll previews and MIDI/JSON writers."
-version = "0.1.0"
+description = "KobiMusic Dettato multi-instrument audio-to-MIDI nodes: a custom loader for the four 28.1M-parameter stage models (transcriber, evidence repairer, grouper, drums) loaded at their released fp32 precision, plus piano-roll previews, MIDI/JSON writers, and an adapter to the native YuE2 ABC score for ComfyUI's built-in YuE2 song generator."
+version = "0.2.0"
 license = { file = "LICENSE" }
 dependencies = [
     "huggingface_hub>=1.0",

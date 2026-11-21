@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+unsloth-tmp/
+appdata/
+npm-cache/
+.cache/
+.unsloth-packages/
+*.egg-info/
+dist/
+build/

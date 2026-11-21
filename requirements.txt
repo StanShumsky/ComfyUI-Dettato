@@ -1,0 +1,5 @@
+huggingface_hub>=1.0
+safetensors
+soxr>=0.3
+scipy
+pretty_midi>=0.2

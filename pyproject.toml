@@ -1,0 +1,31 @@
+[project]
+name = "comfyui-dettato"
+description = "KobiMusic Dettato multi-instrument audio-to-MIDI nodes: a custom loader for the four 28.1M-parameter stage models (transcriber, evidence repairer, grouper, drums) loaded at their released fp32 precision, plus piano-roll previews and MIDI/JSON writers."
+version = "0.1.0"
+license = { file = "LICENSE" }
+dependencies = [
+    "huggingface_hub>=1.0",
+    "safetensors",
+    "soxr>=0.3",
+    "scipy",
+    "pretty_midi>=0.2",
+]
+classifiers = [
+    "Operating System :: OS Independent",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Environment :: GPU :: Apple Metal",
+]
+
+[project.urls]
+Repository = "https://github.com/StanShumsky/ComfyUI-Dettato"
+
+[tool.comfy]
+PublisherId = "shumsky"
+DisplayName = "ComfyUI-Dettato"
+Icon = "https://raw.githubusercontent.com/StanShumsky/ComfyUI-Dettato/main/icon.png"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# importlib mode: prepend mode imports the repo-root __init__.py as a test module.
+addopts = "--import-mode=importlib"
+markers = ["integration: loads real weights; opt in with RUN_DET_WEIGHTS=1"]

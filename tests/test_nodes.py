@@ -230,6 +230,36 @@ def test_small_collection_load_and_run(nodes, models_dir, make_audio):
     json.loads(text)
 
 
+def test_transcriber_weights_are_loaded(nodes, models_dir):
+    """The loader must apply the transcriber's state dict (regression: it once ran on a fresh random init)."""
+    from dettanode.dettato.transcriber.model import LaneNet
+    from safetensors.torch import load_file
+
+    torch.manual_seed(7)
+    cfg_model = {
+        "c": 368, "depth": 2, "exp": 2, "kt": 3, "dilations": [1, 2], "mid": 16, "t_stride": 2,
+        "attn_at": [], "attn_axes": ["pitch", "time"], "attn_heads": 2,
+        "gru_at": [], "gru_hidden": 8, "gru_bf16": True,
+        "heads": ["onset", "frame", "offset", "onset2", "frame2", "offset2"],
+        "harmonics": [1], "extra_nffts": [], "n_fft": 256, "refine": 1, "n_lanes": 88,
+        "pmix": [-2, -1, 1, 2],
+    }
+    file_sd = LaneNet(**cfg_model).state_dict()
+    _write_stage(
+        models_dir / "weights-check", "dettato",
+        {"model": cfg_model, "thresholds": {"on_th": 0.25, "off_th": 0.3, "fr_th": 0.4,
+                                            "fr_low_frames": 2, "on_nms": 3, "v2_th": 0.3}},
+        file_sd,
+    )
+
+    wrapper = nodes.load_dettato("weights-check", "cpu")
+    loaded = {k: v.cpu() for k, v in wrapper["transcriber"].model.state_dict().items()}
+    on_disk = load_file(str(models_dir / "weights-check" / "dettato" / "model.safetensors"))
+    assert set(loaded) == set(on_disk)
+    mismatched = [k for k in on_disk if not torch.equal(loaded[k], on_disk[k].to(loaded[k].dtype))]
+    assert not mismatched, f"{len(mismatched)} tensors differ from the file, e.g. {mismatched[:3]}"
+
+
 def test_local_collection_without_transcriber_error(nodes, models_dir):
     (models_dir / "only-evidence" / "dettato-evidence").mkdir(parents=True)
     (models_dir / "only-evidence" / "dettato-evidence" / "config.json").write_text("{}")

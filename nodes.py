@@ -248,7 +248,9 @@ def load_dettato(name: str, device: str) -> dict:
     else:
         torch_device = torch.device(device)
     config, state = _load_stage("transcriber", name)
-    transcriber = Transcriber(LaneNet(**config["model"]), config["thresholds"], torch_device)
+    model = LaneNet(**config["model"])
+    model.load_state_dict(state, strict=True)
+    transcriber = Transcriber(model, config["thresholds"], torch_device)
     LOGGER.info("Dettato: loaded the transcriber (%s) in fp32 on %s.", name, torch_device)
     return {
         "transcriber": transcriber,

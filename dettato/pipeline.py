@@ -52,7 +52,11 @@ class Transcription:
 
         pm = pretty_midi.PrettyMIDI(initial_tempo=120.0)
         for t in self.tracks:
-            ins = pretty_midi.Instrument(program=0 if t.is_drum else int(t.program), is_drum=t.is_drum, name=t.name)
+            # drum tracks get the acoustic-kit program (37); pretty_midi puts is_drum
+            # instruments on the GM percussion channel (10) itself, so DAWs play the kit
+            # instead of the piano patch that program 0 would select
+            ins = pretty_midi.Instrument(program=37 if t.is_drum else int(t.program),
+                                         is_drum=t.is_drum, name=t.name)
             for on, off, pitch, vel in t.notes:
                 ins.notes.append(pretty_midi.Note(velocity=int(vel), pitch=int(pitch), start=float(on), end=float(off)))
             pm.instruments.append(ins)

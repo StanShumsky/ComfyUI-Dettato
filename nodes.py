@@ -7,7 +7,9 @@ the notes into instrument-named tracks, and a 5.0 M model writes the drums (sour
 loaders do not know, so this pack ships a custom loader: the Loader node loads the transcriber,
 and the Evidence / Grouper / Drums nodes attach the optional stages — each downloading its own
 weights from Hugging Face on first use (or reading them from a local collection folder).
-Everything runs at the released float32 precision.
+Everything runs at the released float32 precision. Transcribe takes up to nine audio sources -
+any audio: files, stems from a separation pack, a video's audio track - and merges their tracks
+into one .mid.
 """
 
 from __future__ import annotations
@@ -39,7 +41,26 @@ from .dettato.transcriber.core import Transcriber
 from .dettato.transcriber.model import LaneNet
 from .abc_score import tracks_to_abc
 from .piano_roll import render_piano_roll
-from .track_io import audio_to_mono, filter_min_velocity, make_tracks_payload, summary_json, write_midi
+from .track_io import (
+    audio_to_mono,
+    dedupe_payload,
+    dedup_sources,
+    quantize_payload,
+    score_text,
+    filter_min_velocity,
+    make_midi_payload,
+    make_tracks_payload,
+    render_midi_bytes,
+    summary_json,
+)
+
+from comfy_api.latest import io
+
+DETTATO_MODEL = io.Custom("DETTATO_MODEL")
+DETTATO_MIDI = io.Custom("DETTATO_MIDI")
+# The consumers accept both the merged payload and the legacy bare-tracks payload, so graphs
+# built against older pack versions keep validating.
+DETTATO_PAYLOAD = io.Custom("DETTATO_MIDI,DETTATO_TRACKS")
 
 LOGGER = logging.getLogger(__name__)
 
@@ -266,7 +287,7 @@ def load_dettato(name: str, device: str) -> dict:
 
 
 def run_transcription(wrapper: dict, audio: dict, progress: ProgressBar | None = None) -> dict:
-    """AUDIO payload -> DETTATO_TRACKS payload (transcription without velocity filtering)."""
+    """AUDIO payload -> the tracks payload (one source's unit of the merged MIDI payload)."""
     def done() -> None:
         if progress is not None:
             progress.update(1)
@@ -376,66 +397,83 @@ def run_transcription(wrapper: dict, audio: dict, progress: ProgressBar | None =
 # --------------------------------------------------------------------- nodes
 
 
-class DettatoLoader:
-    @classmethod
-    def INPUT_TYPES(cls):
-        choices = ["dettato"] + _local_collections()
-        return {
-            "required": {
-                "model": (choices, {"default": "dettato"}),
-                "device": (["auto", "cuda", "mps", "cpu"], {"default": "auto"}),
-            }
-        }
-
-    RETURN_TYPES = ("DETTATO_MODEL",)
-    RETURN_NAMES = ("model",)
-    FUNCTION = "load"
-    CATEGORY = "music/Dettato"
-    DESCRIPTION = (
-        "Load KobiMusic's Dettato transcriber: a 15.3 M-parameter lane network that writes the "
-        "notes of any recording. Attach the optional stages with the Dettato Evidence / Grouper / "
-        "Drums nodes; a stage that is not in the graph is bypassed, and its weights are never "
-        "downloaded or loaded. 'dettato' downloads each stage from Hugging Face into "
-        "models/dettato on first use; a folder in that directory holding the transcriber "
-        "subfolder (dettato/, with its config.json and model.safetensors) is listed and read from "
-        "disk instead, and the stage nodes read their stage from the same folder. All weights "
-        "stay small: the full chain is 28.1 M parameters, 113 MB in fp32, so they run at their "
-        "released precision."
-    )
-
-    def load(self, model: str, device: str):
-        return (load_dettato(model, device),)
+CATEGORY = "music/Dettato"
 
 
-class DettatoStageNode:
-    """Attach one optional stage to a DETTATO_MODEL payload (the transcriber comes from the Loader)."""
-
-    STAGE: str
+class DettatoLoader(io.ComfyNode):
+    """Load the Dettato transcriber payload (DETTATO_MODEL) that the stage and Transcribe nodes consume."""
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {"required": {"model": ("DETTATO_MODEL",)}}
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="DettatoLoader",
+            display_name="Dettato Loader",
+            category=CATEGORY,
+            description=(
+                "Load KobiMusic's Dettato transcriber: a 15.3 M-parameter lane network that writes the"
+                'notes of any recording. Attach the optional stages with the Dettato Evidence / Grouper /'
+                'Drums nodes; a stage that is not in the graph is bypassed, and its weights are never'
+                "downloaded or loaded. 'dettato' downloads each stage from Hugging Face into models/dettato"
+                'on first use; a folder in that directory holding the transcriber subfolder (dettato/, with'
+                'its config.json and model.safetensors) is listed and read from disk instead, and the stage'
+                'nodes read their stage from the same folder. All weights stay small: the full chain is'
+                '28.1 M parameters, 113 MB in fp32, so they run at their released precision.'
+            ),
+            inputs=[
+                io.Combo.Input(
+                    "model",
+                    options=["dettato"] + _local_collections(),
+                    default="dettato",
+                    tooltip="The collection to load; 'dettato' auto-downloads each stage into models/dettato "
+                            "on first use. A folder in that directory holding the transcriber subfolder is "
+                            "listed here and read from disk instead.",
+                ),
+                io.Combo.Input("device", options=["auto", "cuda", "mps", "cpu"], default="auto"),
+            ],
+            outputs=[DETTATO_MODEL.Output(id="model", display_name="model")],
+        )
 
-    RETURN_TYPES = ("DETTATO_MODEL",)
-    RETURN_NAMES = ("model",)
-    FUNCTION = "attach"
-    CATEGORY = "music/Dettato"
+    @classmethod
+    def execute(cls, model: str, device: str) -> io.NodeOutput:
+        return io.NodeOutput(load_dettato(model, device))
 
-    def attach(self, model: dict) -> tuple[dict,]:
-        if model[self.STAGE] is not None:
-            return (model,)
-        config, state = _load_stage(self.STAGE, model["name"])
-        model[self.STAGE] = _build_stage(self.STAGE, config, state, model["device"])
-        LOGGER.info("Dettato: attached the %s stage (%s).", self.STAGE, model["name"])
-        return (model,)
+
+class DettatoStageNode(io.ComfyNode):
+    """Attach one optional stage to a DETTATO_MODEL payload (the transcriber comes from the Loader).
+
+    The concrete nodes below set STAGE and DESCRIPTION; they are the ones registered, not this base.
+    """
+
+    STAGE: str | None = None
+    DESCRIPTION: str = ""
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id=cls.__name__,
+            display_name=f"Dettato {cls.STAGE.capitalize()}",
+            category=CATEGORY,
+            description=cls.DESCRIPTION,
+            inputs=[DETTATO_MODEL.Input("model")],
+            outputs=[DETTATO_MODEL.Output(id="model", display_name="model")],
+        )
+
+    @classmethod
+    def execute(cls, model: dict) -> io.NodeOutput:
+        if model[cls.STAGE] is not None:
+            return io.NodeOutput(model)
+        config, state = _load_stage(cls.STAGE, model["name"])
+        model[cls.STAGE] = _build_stage(cls.STAGE, config, state, model["device"])
+        LOGGER.info("Dettato: attached the %s stage (%s).", cls.STAGE, model["name"])
+        return io.NodeOutput(model)
 
 
 class DettatoEvidence(DettatoStageNode):
     STAGE = "evidence"
     DESCRIPTION = (
-        "Attach the evidence-repair stage (a 4.9 M note-level transformer) to the Dettato model: "
-        "the transcriber's notes are re-checked against its own frame evidence, dropping false "
-        "notes and inserting missed ones. The weights (19 MB) come from the model's collection, "
+        'Attach the evidence-repair stage (a 4.9 M note-level transformer) to the Dettato model:'
+        "the transcriber's notes are re-checked against its own frame evidence, dropping false"
+        "notes and inserting missed ones. The weights (19 MB) come from the model's collection,"
         "auto-downloaded for 'dettato'. Leave this node out to run on the raw transcriber notes."
     )
 
@@ -443,231 +481,420 @@ class DettatoEvidence(DettatoStageNode):
 class DettatoGrouper(DettatoStageNode):
     STAGE = "grouper"
     DESCRIPTION = (
-        "Attach the grouping stage (2.9 M) to the Dettato model: the notes are split into "
-        "instrument-named tracks (73 classes, each with a General MIDI program) and the "
-        "recording's tuning is estimated. The weights (12 MB) come from the model's collection, "
-        "auto-downloaded for 'dettato'. Leave this node out for a single 'Notes' track."
+        'Attach the grouping stage (2.9 M) to the Dettato model: the notes are split into'
+        "instrument-named tracks (73 classes, each with a General MIDI program) and the recording's"
+        "tuning is estimated. The weights (12 MB) come from the model's collection, auto-downloaded"
+        "for 'dettato'. Leave this node out for a single 'Notes' track."
     )
 
 
 class DettatoDrums(DettatoStageNode):
     STAGE = "drums"
     DESCRIPTION = (
-        "Attach the drum stage (5.0 M) to the Dettato model: drum kits and orchestral percussion "
-        "become a 'Drums' track, timpani written at their pitch. It needs a source recorded at "
-        "40 kHz or more (44.1/48 kHz files qualify) and is skipped otherwise, with the reason in "
-        "info_json. The weights (20 MB) come from the model's collection, auto-downloaded for "
+        'Attach the drum stage (5.0 M) to the Dettato model: drum kits and orchestral percussion'
+        "become a 'Drums' track, timpani written at their pitch. It needs a source recorded at 40"
+        'kHz or more (44.1/48 kHz files qualify) and is skipped otherwise, with the reason in'
+        "info_json. The weights (20 MB) come from the model's collection, auto-downloaded for"
         "'dettato'."
     )
 
 
-class DettatoTranscribe:
+class DettatoTranscribe(io.ComfyNode):
+    """Up to nine audio sources (autogrowing slots, one per slot) -> one merged MIDI payload."""
+
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("DETTATO_MODEL",),
-                "audio": ("AUDIO",),
-                "min_velocity": ("INT", {"default": 1, "min": 1, "max": 127}),
-            }
-        }
-
-    RETURN_TYPES = ("DETTATO_TRACKS", "STRING")
-    RETURN_NAMES = ("tracks", "info_json")
-    FUNCTION = "transcribe"
-    CATEGORY = "music/Dettato"
-    DESCRIPTION = (
-        "Transcribe the audio to MIDI tracks, running the attached stages in pipeline order "
-        "(evidence → grouper → drums); a stage that is not in the graph is bypassed. Mono is the "
-        "channel average, at the file's own "
-        "sample rate; the transcriber, the repairer and the grouper read 16 kHz internally, and "
-        "the drum stage runs only when the source was recorded at 40 kHz or more (44.1 kHz and "
-        "48 kHz files qualify; 8/16/24/32 kHz files and most phone recordings do not). The notes are "
-        "performance MIDI: they keep the timing of the recording and are "
-        "not quantized to a beat. min_velocity drops quieter notes (1 keeps everything). "
-        "Outputs: tracks for the Dettato Piano Roll and the MIDI writers below, and a JSON summary "
-        "(track names and note counts, the tuning estimate, which drum model ran). GPU timing: a "
-        "4-minute song takes about 15 s on an RTX 5060; the CPU works but is roughly 6x slower."
-    )
-
-    def transcribe(self, model: dict, audio: dict, min_velocity: int):
-        mono, rate = audio_to_mono(audio)
-        chunks = 1
-        if model["grouper"] is not None:
-            chunks += 1
-        if model["drums"] is not None and rate >= MIN_SOURCE_RATE:
-            chunks += 1
-        progress = ProgressBar(chunks)
-        payload = run_transcription(model, audio, progress)
-        payload = make_tracks_payload(
-            filter_min_velocity(payload["tracks"], min_velocity), payload["seconds"], payload["source"], payload["info"]
+    def define_schema(cls):
+        return io.Schema(
+            node_id="DettatoTranscribe",
+            display_name="Dettato Transcribe to MIDI",
+            category="music/Dettato",
+            description=(
+                "Transcribe one or more audio sources to a single merged .mid. One slot (audio_0) "
+                "is shown by default and each used slot reveals the next (audio_1, audio_2, ...), "
+                "up to nine total - e.g. one stem per slot from a separation pack, so 'Separate -> "
+                "Transcribe -> Save MIDI' is the whole separation-to-MIDI workflow; any audio "
+                "works (files, stems, a video's audio track). Every source runs the attached "
+                "stages in pipeline "
+                "order (evidence -> grouper -> drums); a stage that is not in the graph is "
+                "bypassed. Mono is the channel average, at the file's own sample rate; the "
+                "transcriber, the repairer and the grouper read 16 kHz internally, and the drum "
+                "stage runs only when a source was recorded at 40 kHz or more (44.1 kHz and 48 "
+                "kHz files qualify; 8/16/24/32 kHz files and most phone recordings do not). The "
+                "notes are performance MIDI: they keep the timing of the recording; the "
+                "Dettato Quantize MIDI node snaps onsets to a tempo x grid afterwards when "
+                "you want the MIDI to sit on the grid. The sources' tracks merge in slot order; "
+                "the first "
+                "occurrence of a track name keeps it, and repeats are renamed 'Name (slot)' with "
+                "the slot name, so a DAW shows 'Piano' and 'Piano (audio_1)'. Sources of one "
+                "recording are length-aligned by the separator, so the merged file is "
+                "phase-correct by construction. min_velocity drops quieter notes per source (1 "
+                "keeps everything). dedup drops redundant tracks before the merge: when the same "
+                "instrument was transcribed from several stems of one mix (separation artifacts), "
+                "only the stem with the most notes of it is kept - on for a separated-stem run, "
+                "off when the sources are different recordings. Outputs: the merged MIDI payload (tracks, length, source "
+                "labels, per-source info, and the .mid rendered once) for the nodes below, and a "
+                "JSON summary. A different stage chain per stem means one Transcribe and one Save "
+                "MIDI per stem. GPU timing: a 4-minute song takes about 15 s on an RTX 5060; the "
+                "CPU works but is roughly 6x slower."
+            ),
+            inputs=[
+                DETTATO_MODEL.Input("model"),
+                io.Autogrow.Input(
+                    "audios",
+                    optional=True,
+                    tooltip="One audio per slot (e.g. one separated stem per slot). audio_0 is shown by "
+                            "default; each used slot reveals the next, up to nine total.",
+                    template=io.Autogrow.TemplatePrefix(
+                        input=io.Audio.Input("audio"), prefix="audio_", min=0, max=9),
+                ),
+                io.Int.Input("min_velocity", default=1, min=1, max=127,
+                             tooltip="Drop notes quieter than this per source (1 keeps everything)."),
+                io.Boolean.Input("dedup", default=False,
+                                 tooltip="Drop redundant tracks before the merge: when the same "
+                                         "instrument was transcribed from several stems, only the "
+                                         "stem with the most notes of it is kept (on for a "
+                                         "separated-stem run; off when the sources are different "
+                                         "recordings)."),
+            ],
+            outputs=[DETTATO_MIDI.Output(display_name="midi"), io.String.Output(display_name="info_json")],
         )
+
+    @classmethod
+    def execute(cls, model: dict, audios: dict | None, min_velocity: int = 1,
+                dedup: bool = False) -> io.NodeOutput:
+        """All connected audio slots (audio_0, audio_1, ...) -> the merged MIDI payload."""
+        audios = {name: aud for name, aud in (audios or {}).items() if aud is not None}
+        if not audios:
+            raise ValueError("Connect at least one audio source.")
+        sources = [(name, audios[name]) for name in
+                   sorted(audios, key=lambda n: int(n.rsplit("_", 1)[-1]))]
+        if model["drums"] is None:
+            eligible = [name for name, aud in sources if int(aud["sample_rate"]) >= MIN_SOURCE_RATE]
+            if eligible:
+                LOGGER.warning(
+                    "Dettato: no Drums stage in the model chain - %s record(s) at %d+ Hz would "
+                    "have produced a 'Drums' track. Attach the Dettato Drums node to the model "
+                    "to get drums.",
+                    ", ".join(eligible), MIN_SOURCE_RATE,
+                )
+        chunks = 0
+        for _, aud in sources:
+            rate = int(aud["sample_rate"])
+            chunks += 1
+            if model["grouper"] is not None:
+                chunks += 1
+            if model["drums"] is not None and rate >= MIN_SOURCE_RATE:
+                chunks += 1
+        progress = ProgressBar(chunks)
+        results = []
+        for label, aud in sources:
+            payload = run_transcription(model, aud, progress)
+            payload = make_tracks_payload(
+                filter_min_velocity(payload["tracks"], min_velocity), payload["seconds"], label, payload["info"]
+            )
+            results.append((label, payload))
         mm.soft_empty_cache()
-        return (payload, summary_json(payload))
+        if dedup:
+            results, stats = dedup_sources(results)
+        else:
+            stats = None
+        payload = make_midi_payload(results)
+        if stats is not None:
+            payload["info"]["dedup"] = stats
+        return io.NodeOutput(payload, summary_json(payload))
 
 
-class DettatoPianoRoll:
+
+class DettatoDedupeMIDI(io.ComfyNode):
+    """Merge same-named tracks and drop the onset-duplicate notes of a stem separation."""
+
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "tracks": ("DETTATO_TRACKS",),
-                "px_per_ms": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10.0, "step": 0.1}),
-                "max_seconds": ("INT", {"default": 0, "min": 0, "max": 36000}),
-                "show_drum_panel": ("BOOLEAN", {"default": True}),
-            }
-        }
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="DettatoDedupeMIDI",
+            display_name="Dettato Dedupe MIDI",
+            category=CATEGORY,
+            description=(
+                "Cleans the duplication artifacts of a stem separation: when the same sound is "
+                "transcribed from several stems, the merge shows it once per stem ('Drums' plus "
+                "'Drums (audio_1)' ... 'Drums (audio_5)') with small onset shifts, so the drums "
+                "- and any other instrument split across stems - sound doubled. This node pools "
+                "the tracks of one instrument (the names differ only by the ' (slot)' merge "
+                "suffix) into a single track and scans the pool in onset order: a note is a "
+                "duplicate when the gap to the last kept note of the same pitch is within "
+                "window_ms, and the louder note of a duplicate pair wins (a quiet ghost never "
+                "replaces a loud real one, and a loud real one replaces a quiet ghost that "
+                "preceded it). 50 ms is the safe default: on a 6-stem run it removed all the "
+                "tight drum duplicates while the main drum track kept 100% of its own fast "
+                "repeats; raise it to reach smeared copies shifted by 100-300 ms, knowing that "
+                "fast same-pitch repeats inside that gap will be collapsed. 0 pools the tracks "
+                "without dropping anything. Put it between Transcribe and Save MIDI; its "
+                "outputs feed the same consumers as Transcribe's."
+            ),
+            inputs=[
+                DETTATO_PAYLOAD.Input("midi"),
+                io.Int.Input("window_ms", default=50, min=0, max=500,
+                             tooltip="Onset window in ms for same-pitch duplicates "
+                                     "(0 = pool the tracks, drop nothing)."),
+            ],
+            outputs=[DETTATO_MIDI.Output(display_name="midi"), io.String.Output(display_name="info_json")],
+        )
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("piano_roll",)
-    FUNCTION = "render"
-    CATEGORY = "music/Dettato"
-    DESCRIPTION = (
-        "The piano roll of the transcription: the upper panel is the 88-key range (G7..A0, C rows "
-        "shaded), the lower panel the GM drum keys 27-87; tracks are coloured in track order, "
-        "drums in red, note brightness follows velocity, and a line marks every second. "
-        "px_per_ms is the horizontal scale (0 = fit the song into about 1400 px); max_seconds "
-        "caps the visible length (0 = the whole song). Feed the result to a Preview Image node."
-    )
-
-    def render(self, tracks: dict, px_per_ms: float, max_seconds: int, show_drum_panel: bool):
-        roll = render_piano_roll(tracks["tracks"], tracks["seconds"], px_per_ms, max_seconds, show_drum_panel)
-        return (torch.from_numpy(roll)[None].contiguous(),)
-
-
-class DettatoSaveMIDI:
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "tracks": ("DETTATO_TRACKS",),
-                "filename_prefix": ("STRING", {"default": "dettato/midi"}),
-            }
-        }
+    def execute(cls, midi: dict, window_ms: int) -> io.NodeOutput:
+        payload = dedupe_payload(midi, window_ms)
+        return io.NodeOutput(payload, summary_json(payload))
 
-    RETURN_TYPES = ()
-    OUTPUT_NODE = True
-    FUNCTION = "save"
-    CATEGORY = "music/Dettato"
-    DESCRIPTION = (
-        "Write the transcription to ComfyUI's output folder as .mid (one General MIDI track per "
-        "instrument, named after it, 120 BPM with times in seconds). The JSON summary (track "
-        "names and note counts, the tuning estimate, the drum-model decision) is the info_json "
-        "output of the Transcribe node; save it with a text node when needed."
-    )
 
-    def save(self, tracks: dict, filename_prefix: str):
+class DettatoQuantizeMIDI(io.ComfyNode):
+    """Snap every note onset of a MIDI payload to a tempo x grid."""
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="DettatoQuantizeMIDI",
+            display_name="Dettato Quantize MIDI",
+            category=CATEGORY,
+            description=(
+                "Snaps every note onset to a musical grid defined by the tempo and the grid "
+                "division (1/4, 1/8, 1/16 or 1/32 notes): a note closer to a grid line than to "
+                "the one before or after it moves to that line, and the note's length is "
+                "preserved - the offset moves by the same amount as the onset, so nothing ends "
+                "up shorter or longer (notes under 2 ms are stretched to that minimum, so "
+                "nothing is zero-length). It works on any DETTATO_MIDI payload - the Transcribe "
+                "output or the output of another MIDI node like Dedupe - so the grid follows "
+                "the whole chain of edits, and it writes its stats (grid, notes moved, max "
+                "shift) into info.quantize. max_shift_ms is a quick tell for a wrong tempo: if "
+                "notes moved more than half a grid step, the tempo or the division is off. Put "
+                "it between the last MIDI node and Save MIDI; its outputs feed the same "
+                "consumers."
+            ),
+            inputs=[
+                DETTATO_PAYLOAD.Input("midi"),
+                io.Float.Input("tempo", default=120.0, min=20.0, max=300.0, step=1.0,
+                               tooltip="Grid tempo in BPM."),
+                io.Combo.Input("grid", options=["1/4", "1/8", "1/16", "1/32"], default="1/16",
+                               tooltip="Grid division (notes per beat)."),
+            ],
+            outputs=[DETTATO_MIDI.Output(display_name="midi"), io.String.Output(display_name="info_json")],
+        )
+
+    @classmethod
+    def execute(cls, midi: dict, tempo: float = 120.0, grid: str = "1/16") -> io.NodeOutput:
+        payload = quantize_payload(midi, tempo, grid)
+        return io.NodeOutput(payload, summary_json(payload))
+
+
+class DettatoPianoRoll(io.ComfyNode):
+    """The piano roll image of a transcription payload."""
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="DettatoPianoRoll",
+            display_name="Dettato Piano Roll",
+            category=CATEGORY,
+            description=(
+                'The piano roll of the transcription: the upper panel is the 88-key range (G7..A0, C rows'
+                'shaded), the lower panel the GM drum keys 27-87; tracks are coloured in track order, drums'
+                'in red, note brightness follows velocity, and a line marks every second.'
+                'px_per_ms is the horizontal scale (0 = fit the song into about 1400 px); max_seconds caps'
+                'the visible length (0 = the whole song). Feed the result to a Preview Image node.'
+            ),
+            inputs=[
+                DETTATO_PAYLOAD.Input("midi"),
+                io.Float.Input("px_per_ms", default=0.0, min=0.0, max=10.0, step=0.1),
+                io.Int.Input("max_seconds", default=0, min=0, max=36000),
+                io.Boolean.Input("show_drum_panel", default=True),
+            ],
+            outputs=[io.Image.Output(id="piano_roll", display_name="piano_roll")],
+        )
+
+    @classmethod
+    def execute(cls, midi: dict, px_per_ms: float, max_seconds: int,
+                show_drum_panel: bool) -> io.NodeOutput:
+        roll = render_piano_roll(midi["tracks"], midi["seconds"], px_per_ms, max_seconds, show_drum_panel)
+        return io.NodeOutput(torch.from_numpy(roll)[None].contiguous())
+
+
+class DettatoSaveMIDI(io.ComfyNode):
+    """Write the merged MIDI payload to ComfyUI's output folder."""
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="DettatoSaveMIDI",
+            display_name="Dettato Save MIDI",
+            category=CATEGORY,
+            description=(
+                "Write the .mid to ComfyUI's output folder as <prefix>_XXXXX.mid - one General MIDI track"
+                'per instrument, named after it, 120 BPM with times in seconds, numbered so runs never'
+                "overwrite each other. The MIDI payload (the output of the Transcribe node) is written"
+                'verbatim: its .mid was rendered once at the merge. The JSON summary (track names and note'
+                'counts, the tuning estimate, the drum-model decision) is the info_json output of the'
+                'Transcribe node; save it with a text node when needed.'
+            ),
+            is_output_node=True,
+            inputs=[
+                DETTATO_PAYLOAD.Input("midi"),
+                io.String.Input("filename_prefix", default="dettato/midi"),
+            ],
+            outputs=[],
+        )
+
+    @classmethod
+    def execute(cls, midi: dict, filename_prefix: str) -> io.NodeOutput:
         folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
             filename_prefix, folder_paths.get_output_directory(), 1, 1
         )
         # get_save_image_path counts PNGs only; count our own format to avoid overwrites.
         counter = len(list(Path(folder).glob(f"{filename}_*.mid")))
         path = Path(folder) / f"{filename}_{counter:05d}.mid"
-        write_midi(tracks, path)
-        n_notes = sum(len(np.asarray(t.notes, np.float64).reshape(-1, 4)) for t in tracks["tracks"])
-        LOGGER.info("Dettato: wrote %s (%d tracks, %d notes).", path, len(tracks["tracks"]), n_notes)
-        # an output node must return a tuple; () = no outputs (None breaks ComfyUI's merge_result_data)
-        return ()
+        data = midi.get("midi")
+        if data is None:
+            # a legacy DETTATO_TRACKS payload (bare tracks, no rendered bytes): render it now
+            data = render_midi_bytes(midi["tracks"], midi.get("seconds", 0.0))
+        path.write_bytes(data)
+        n_notes = sum(len(np.asarray(t.notes, np.float64).reshape(-1, 4)) for t in midi["tracks"])
+        LOGGER.info("Dettato: wrote %s (%d tracks, %d notes).", path, len(midi["tracks"]), n_notes)
+        # an output node returns no values (None would break ComfyUI's merge_result_data)
+        return io.NodeOutput()
 
 
+class DettatoInfo(io.ComfyNode):
+    """The transcription summary as a JSON string."""
 
-class DettatoInfo:
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "tracks": ("DETTATO_TRACKS",),
-            }
-        }
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="DettatoInfo",
+            display_name="Dettato Info",
+            category=CATEGORY,
+            description=(
+                'The transcription summary as JSON: source, length in seconds, per-track name / General'
+                'MIDI program / is_drum / note count, the note statistics (transcribed, dropped by the'
+                'repairer, inserted by the repairer, grouped), the tuning estimate in cents and the drum'
+                "stage's decision (hits and router value, or why it was skipped). Use it to branch or to"
+                "save the run's metadata with another text node."
+            ),
+            inputs=[DETTATO_PAYLOAD.Input("midi")],
+            outputs=[io.String.Output(id="info_json", display_name="info_json")],
+        )
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("info_json",)
-    FUNCTION = "info"
-    CATEGORY = "music/Dettato"
-    DESCRIPTION = (
-        "The transcription summary as JSON: source, length in seconds, per-track name / General "
-        "MIDI program / is_drum / note count, the note statistics (transcribed, dropped by the "
-        "repairer, inserted by the repairer, grouped), the tuning estimate in cents and the drum "
-        "stage's decision (hits and router value, or why it was skipped). Use it to branch or to "
-        "save the run's metadata with another text node."
-    )
-
-    def info(self, tracks: dict):
-        return (summary_json(tracks),)
-
-
-class DettatoToYuE2ABC:
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "tracks": ("DETTATO_TRACKS",),
-                "mode": (["melody", "full"], {"default": "melody"}),
-                "melody_track": ("STRING", {"default": ""}),
-                "ins_track": ("STRING", {"default": ""}),
-                "key": ("STRING", {"default": "auto"}),
-                "tempo": ("INT", {"default": 0, "min": 0, "max": 500}),
-                "meter": (["4/4", "3/4", "6/8", "7/8"], {"default": "4/4"}),
-                "grid": (["1/16", "1/32"], {"default": "1/16"}),
-                "octave": (["auto", "-2", "-1", "0", "1", "2"], {"default": "auto"}),
-            }
-        }
+    def execute(cls, midi: dict) -> io.NodeOutput:
+        return io.NodeOutput(summary_json(midi))
 
-    RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("abc_score", "abc_summary")
-    FUNCTION = "convert"
-    CATEGORY = "music/Dettato"
-    DESCRIPTION = (
-        "Convert the transcription to the native two-voice ABC score that ComfyUI's built-in "
-        "YuE2 Generate Music node renders: wire the abc_score output to that node's abc input and "
-        "YuE2 regenerates the song from your transcribed melody. mode: 'melody' (the default and "
-        "the recommended cover path) leaves the score chord-free, so YuE2 keeps your melody and "
-        "writes its own accompaniment; 'full' derives chord symbols from the non-melody tracks. "
-        "melody_track: the exact name of the track to use as the melody (empty = pick the most "
-        "lead-like pitched track automatically - a voice/vocal track wins, a bass track is never "
-        "picked); ins_track: a second pitched track for the Ins voice (empty = the busiest "
-        "remaining line above G3 that is not a bass; 'none' = the Ins voice is rests). key: 'auto' "
-        "runs key-finding on the melody, or a standard key such as 'Am' or 'Db'; tempo: 0 fits a "
-        "grid to the onsets (drum hits weighted double), or a fixed BPM. octave: 'auto' moves a "
-        "line by whole octaves into the C4..A#5 window when its middle pitch lies outside it, "
-        "because YuE2 sings the octave it is given; an integer transposes both lines. The output "
-        "is the exact dialect YuE2 and SheetSage2 use, so you can inspect it, correct a few notes "
-        "in any text editor and feed the edited text to YuE2. See the README's YuE2 section."
-    )
 
-    def convert(self, tracks: dict, mode: str, melody_track: str, ins_track: str, key: str,
-                tempo: int, meter: str, grid: str, octave: str = "auto"):
+class DettatoMIDIToText(io.ComfyNode):
+    """The transcription as generic JSON text for other libraries and text nodes."""
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="DettatoMIDIToText",
+            display_name="Dettato MIDI to Text",
+            category=CATEGORY,
+            description=(
+                "The transcription as generic JSON text: {seconds, tracks: [{name, program, is_drum, "
+                "notes: [[onset s, offset s, pitch, velocity], ...]]}}. Any library that reads JSON can "
+                "use it, and it can be saved with any text node (e.g. the core Save Text) or fed to "
+                "another pack's text input - unlike the .mid, it needs no MIDI parser. program is null "
+                "on drum tracks. Takes the midi output of Transcribe (or Dedupe MIDI); the same text is "
+                "carried inside the payload."
+            ),
+            inputs=[DETTATO_PAYLOAD.Input("midi")],
+            outputs=[io.String.Output(id="midi_text", display_name="midi_text")],
+        )
+
+    @classmethod
+    def execute(cls, midi: dict) -> io.NodeOutput:
+        text = midi.get("midi_text")
+        if text is None:
+            text = score_text(midi["tracks"], midi.get("seconds", 0.0))
+        return io.NodeOutput(text)
+
+
+class DettatoToYuE2ABC(io.ComfyNode):
+    """Convert the transcription to YuE2's native two-voice ABC score."""
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="DettatoToYuE2ABC",
+            display_name="Dettato To YuE2 ABC",
+            category=CATEGORY,
+            description=(
+                "Convert the transcription to the native two-voice ABC score that ComfyUI's built-in YuE2"
+                "Generate Music node renders: wire the abc_score output to that node's abc input and YuE2"
+                "regenerates the song from your transcribed melody. mode: 'melody' (the default and the"
+                'recommended cover path) leaves the score chord-free, so YuE2 keeps your melody and writes'
+                "its own accompaniment; 'full' derives chord symbols from the non-melody tracks."
+                'melody_track: the exact name of the track to use as the melody (empty = pick the most'
+                'lead-like pitched track automatically - a voice/vocal track wins, a bass track is never'
+                'picked); ins_track: a second pitched track for the Ins voice (empty = the busiest'
+                "remaining line above G3 that is not a bass; 'none' = the Ins voice is rests). key: 'auto'"
+                "runs key-finding on the melody, or a standard key such as 'Am' or 'Db'; tempo: 0 fits a"
+                "grid to the onsets (drum hits weighted double), or a fixed BPM. octave: 'auto' moves a"
+                'line by whole octaves into the C4..A#5 window when its middle pitch lies outside it,'
+                'because YuE2 sings the octave it is given; an integer transposes both lines. The output is'
+                'the exact dialect YuE2 and SheetSage2 use, so you can inspect it, correct a few notes in'
+                "any text editor and feed the edited text to YuE2. See the README's YuE2 section."
+            ),
+            inputs=[
+                DETTATO_PAYLOAD.Input("midi"),
+                io.Combo.Input("mode", options=["melody", "full"], default="melody"),
+                io.String.Input("melody_track", default=""),
+                io.String.Input("ins_track", default=""),
+                io.String.Input("key", default="auto"),
+                io.Int.Input("tempo", default=0, min=0, max=500),
+                io.Combo.Input("meter", options=["4/4", "3/4", "6/8", "7/8"], default="4/4"),
+                io.Combo.Input("grid", options=["1/16", "1/32"], default="1/16"),
+                io.Combo.Input("octave", options=["auto", "-2", "-1", "0", "1", "2"], default="auto"),
+            ],
+            outputs=[
+                io.String.Output(id="abc_score", display_name="abc_score"),
+                io.String.Output(id="abc_summary", display_name="abc_summary"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, midi: dict, mode: str, melody_track: str, ins_track: str, key: str,
+                tempo: int, meter: str, grid: str, octave: str) -> io.NodeOutput:
         meta = {}
         abc = tracks_to_abc(
-            tracks["tracks"], tracks["seconds"], mode=mode, melody_track=melody_track,
+            midi["tracks"], midi["seconds"], mode=mode, melody_track=melody_track,
             ins_track=ins_track, key=key, tempo=tempo, meter=meter, grid=grid, octave=octave,
             out_meta=meta,
         )
-        return (abc, json.dumps(meta, indent=2, sort_keys=True))
+        return io.NodeOutput(abc, json.dumps(meta, indent=2, sort_keys=True))
 
 
-class DettatoSaveABC:
+class DettatoSaveABC(io.ComfyNode):
+    """Write an ABC score to ComfyUI's output folder."""
+
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "abc": ("STRING", {"default": "", "multiline": True}),
-                "filename_prefix": ("STRING", {"default": "dettato/abc"}),
-            }
-        }
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="DettatoSaveABC",
+            display_name="Dettato Save ABC",
+            category=CATEGORY,
+            description=(
+                "Write an ABC score to ComfyUI's output folder as <prefix>_XXXXX.abc (e.g. the abc_score"
+                'output of the To YuE2 ABC node), numbered so runs never overwrite each other. Use it to'
+                "keep the run's symbolic record, or to open the score in an editor, correct a few notes and"
+                'feed the edited text to YuE2.'
+            ),
+            is_output_node=True,
+            inputs=[
+                io.String.Input("abc", default="", multiline=True),
+                io.String.Input("filename_prefix", default="dettato/abc"),
+            ],
+            outputs=[],
+        )
 
-    RETURN_TYPES = ()
-    OUTPUT_NODE = True
-    FUNCTION = "save"
-    CATEGORY = "music/Dettato"
-    DESCRIPTION = (
-        "Write an ABC score to ComfyUI's output folder as <prefix>_XXXXX.abc (e.g. the "
-        "abc_score output of the To YuE2 ABC node), numbered so runs never overwrite each other. "
-        "Use it to keep the run's symbolic record, or to open the score in an editor, correct a "
-        "few notes and feed the edited text to YuE2."
-    )
-
-    def save(self, abc: str, filename_prefix: str):
+    @classmethod
+    def execute(cls, abc: str, filename_prefix: str) -> io.NodeOutput:
         folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
             filename_prefix, folder_paths.get_output_directory(), 1, 1
         )
@@ -676,18 +903,24 @@ class DettatoSaveABC:
         path = Path(folder) / f"{filename}_{counter:05d}.abc"
         path.write_text(abc, encoding="utf-8")
         LOGGER.info("Dettato: wrote %s (%d chars).", path, len(abc))
-        return ()
+        return io.NodeOutput()
 
 
+#: id -> class registry. The ComfyUI loader does not read this dict: the pack registers through
+#: the V3 entrypoint in __init__.py (comfy_entrypoint -> get_node_list). The mapping stays as the
+#: single reference list and the test seam; it must match get_node_list.
 NODE_CLASS_MAPPINGS = {
     "DettatoLoader": DettatoLoader,
     "DettatoEvidence": DettatoEvidence,
     "DettatoGrouper": DettatoGrouper,
     "DettatoDrums": DettatoDrums,
     "DettatoTranscribe": DettatoTranscribe,
+    "DettatoDedupeMIDI": DettatoDedupeMIDI,
+    "DettatoQuantizeMIDI": DettatoQuantizeMIDI,
     "DettatoPianoRoll": DettatoPianoRoll,
     "DettatoSaveMIDI": DettatoSaveMIDI,
     "DettatoInfo": DettatoInfo,
+    "DettatoMIDIToText": DettatoMIDIToText,
     "DettatoToYuE2ABC": DettatoToYuE2ABC,
     "DettatoSaveABC": DettatoSaveABC,
 }
@@ -697,9 +930,12 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DettatoGrouper": "Dettato Grouper",
     "DettatoDrums": "Dettato Drums",
     "DettatoTranscribe": "Dettato Transcribe to MIDI",
+    "DettatoDedupeMIDI": "Dettato Dedupe MIDI",
+    "DettatoQuantizeMIDI": "Dettato Quantize MIDI",
     "DettatoPianoRoll": "Dettato Piano Roll",
     "DettatoSaveMIDI": "Dettato Save MIDI",
     "DettatoInfo": "Dettato Info",
+    "DettatoMIDIToText": "Dettato MIDI to Text",
     "DettatoToYuE2ABC": "Dettato To YuE2 ABC",
     "DettatoSaveABC": "Dettato Save ABC",
 }

@@ -219,8 +219,8 @@ def test_errors():
 def test_node_to_yue2_abc(nodes, make_tracks):
     conv = nodes.NODE_CLASS_MAPPINGS[next(c for c in nodes.NODE_CLASS_MAPPINGS
                                           if c.endswith("ToYuE2ABC"))]
-    abc, summary = conv().convert(make_tracks(seconds=4.0), "melody", "Piano", "none",
-                                  "auto", 120, "4/4", "1/16")
+    abc, summary = conv.execute(make_tracks(seconds=4.0), "melody", "Piano", "none",
+                                  "auto", 120, "4/4", "1/16", "auto").args
     assert parse(abc).bpm == 120
     meta = json.loads(summary)
     assert meta["melody_track"] == "Piano" and meta["bpm"] == 120
@@ -231,12 +231,11 @@ def test_node_save_abc_writes_numbered_files(nodes, output_dir, make_tracks):
                                           if c.endswith("ToYuE2ABC"))]
     saver = nodes.NODE_CLASS_MAPPINGS[next(c for c in nodes.NODE_CLASS_MAPPINGS
                                            if c.endswith("SaveABC"))]
-    prefix = saver.INPUT_TYPES()["required"]["filename_prefix"][1]["default"]
-    abc, _ = conv().convert(make_tracks(seconds=4.0), "melody", "Piano", "none",
-                            "auto", 120, "4/4", "1/16")
-    node = saver()
+    prefix = next(i for i in saver.define_schema().inputs if i.id == 'filename_prefix').default
+    abc, _ = conv.execute(make_tracks(seconds=4.0), "melody", "Piano", "none",
+                            "auto", 120, "4/4", "1/16", "auto").args
     for _ in range(2):
-        node.save(abc, prefix)
+        saver.execute(abc, prefix)
     folder, stem = output_dir / Path(prefix).parent, Path(prefix).name
     files = sorted(p.name for p in folder.glob(stem + "_*.abc"))
     assert files == ["abc_00000.abc", "abc_00001.abc"]

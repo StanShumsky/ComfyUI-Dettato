@@ -8,7 +8,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize("workflow", ["audio2midi"])
+@pytest.mark.parametrize("workflow", ["audio2midi", "audio2midi_roformer"])
 def test_example_workflow(nodes, workflow):
     data = json.loads((ROOT / "example_workflows" / f"{workflow}.json").read_text())
     by_id = {n["id"]: n for n in data["nodes"]}
@@ -20,7 +20,8 @@ def test_example_workflow(nodes, workflow):
             link = links[inp["link"]]
             assert link[3] == node["id"] and link[4] == slot
             source = by_id[link[1]]["outputs"][link[2]]
-            assert source["type"] == link[5] == inp["type"]
+            assert source["type"] == link[5]
+            assert link[5] in inp["type"].split(","), (node["type"], slot)  # input may declare a union
             assert inp["link"] in (source["links"] or [])
         for slot, out in enumerate(node.get("outputs") or []):
             for link_id in out.get("links") or []:
@@ -29,14 +30,13 @@ def test_example_workflow(nodes, workflow):
         cls = nodes.NODE_CLASS_MAPPINGS.get(node["type"])
         if cls is None:
             continue
-        required = cls.INPUT_TYPES()["required"]
+        schema = cls.define_schema()
+        inputs = {i.id: i for i in schema.inputs
+                  if not i.optional and not isinstance(i, nodes.io.Autogrow.Input)}
         linked = {inp["name"] for inp in node.get("inputs") or []}
-        widgets = [name for name in required if name not in linked]
+        widgets = [name for name in inputs if name not in linked]
         assert len(node["widgets_values"]) == len(widgets), node["type"]
         for name, value in zip(widgets, node["widgets_values"]):
-            spec = required[name]
-            if isinstance(spec[0], list):
-                if len(spec) == 2 and spec[1].get("multi_select"):
-                    assert isinstance(value, list) and value and all(v in spec[0] for v in value), (node["type"], name)
-                else:
-                    assert value in spec[0], (node["type"], name)
+            options = getattr(inputs[name], "options", None)
+            if options is not None:
+                assert value in options, (node["type"], name)

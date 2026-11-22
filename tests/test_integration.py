@@ -36,15 +36,15 @@ def synth_song(t=4.0, rate=48000):
 
 @pytest.fixture(scope="module")
 def wrapper(nodes):
-    (w,) = nodes.DettatoLoader().load("dettato", "auto")
+    (w,) = nodes.DettatoLoader.execute("dettato", "auto").args
     for stage in (nodes.DettatoEvidence, nodes.DettatoGrouper, nodes.DettatoDrums):
-        (w,) = stage().attach(w)
+        (w,) = stage.execute(w).args
     return w
 
 
 @pytest.fixture(scope="module")
 def transcription(nodes, wrapper):
-    (payload, text) = nodes.DettatoTranscribe().transcribe(wrapper, synth_song(), 1)
+    (payload, text) = nodes.DettatoTranscribe.execute(wrapper, {'audio_0': synth_song()}, 1).args
     return payload, text
 
 
@@ -64,7 +64,7 @@ def test_transcribe_structure(nodes, transcription):
 
 def test_piano_roll_from_real_tracks(nodes, transcription):
     payload = transcription[0]
-    (image,) = nodes.DettatoPianoRoll().render(payload, 0.0, 0, True)
+    (image,) = nodes.DettatoPianoRoll.execute(payload, 0.0, 0, True).args
     assert image.shape[0] == 1 and image.shape[-1] == 3  # (1, H, W, 3)
     assert image.shape[1] > 100 and image.shape[2] > 100
     assert image.shape[-1] == 3
@@ -72,7 +72,7 @@ def test_piano_roll_from_real_tracks(nodes, transcription):
 
 def test_save_midi_roundtrip(nodes, transcription, output_dir):
     payload = transcription[0]
-    nodes.DettatoSaveMIDI().save(payload, "integration/midi")
+    nodes.DettatoSaveMIDI.execute(payload, "integration/midi")
     from pretty_midi import PrettyMIDI
 
     path = next((output_dir / "integration").glob("midi_*.mid"))
@@ -84,7 +84,7 @@ def test_save_midi_roundtrip(nodes, transcription, output_dir):
 
 
 def test_info_node(nodes, transcription):
-    (text,) = nodes.DettatoInfo().info(transcription[0])
+    (text,) = nodes.DettatoInfo.execute(transcription[0]).args
     data = json.loads(text)
     assert data["seconds"] == pytest.approx(4.0, abs=0.05)
     assert data["tracks"]

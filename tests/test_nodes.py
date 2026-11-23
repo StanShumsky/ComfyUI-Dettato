@@ -58,6 +58,8 @@ def test_loader_choices(nodes, models_dir):
     assert model_input().default == "dettato"
     device = next(i for i in loader.define_schema().inputs if i.id == "device")
     assert device.options == ["auto", "cuda", "mps", "cpu"]
+    precision = next(i for i in loader.define_schema().inputs if i.id == "precision")
+    assert precision.options == ["auto", "bf16", "fp16", "fp32"]
     # a collection folder appears in the dropdown
     (models_dir / "my-pack" / "dettato").mkdir(parents=True)
     (models_dir / "my-pack" / "dettato" / "config.json").write_text("{}")
@@ -233,7 +235,7 @@ def test_small_collection_load_and_run(nodes, models_dir, make_audio):
         Repairer(**evidence_cfg).state_dict(),
     )
 
-    wrapper = nodes.load_dettato("small", "cpu")
+    wrapper = nodes.load_dettato("small", "fp32", "cpu")
     assert wrapper["evidence"] is None and wrapper["grouper"] is None and wrapper["drums"] is None
     # a stage that is not in the collection cannot be attached
     with pytest.raises(FileNotFoundError, match="lacks stage"):
@@ -278,7 +280,7 @@ def test_transcriber_weights_are_loaded(nodes, models_dir):
         file_sd,
     )
 
-    wrapper = nodes.load_dettato("weights-check", "cpu")
+    wrapper = nodes.load_dettato("weights-check", "fp32", "cpu")
     loaded = {k: v.cpu() for k, v in wrapper["transcriber"].model.state_dict().items()}
     on_disk = load_file(str(models_dir / "weights-check" / "dettato" / "model.safetensors"))
     assert set(loaded) == set(on_disk)
@@ -291,12 +293,12 @@ def test_local_collection_without_transcriber_error(nodes, models_dir):
     (models_dir / "only-evidence" / "dettato-evidence" / "config.json").write_text("{}")
     (models_dir / "only-evidence" / "dettato-evidence" / "model.safetensors").write_bytes(b"x")
     with pytest.raises(FileNotFoundError, match="lacks the transcriber"):
-        nodes.DettatoLoader.execute("only-evidence", "cpu")
+        nodes.DettatoLoader.execute("only-evidence", "auto", "cpu")
 
 
 def test_unknown_model_error(nodes, models_dir):
     with pytest.raises(FileNotFoundError, match="not found"):
-        nodes.DettatoLoader.execute("nope", "cpu")
+        nodes.DettatoLoader.execute("nope", "auto", "cpu")
 # --------------------------------------------------------------------- multi-source: flatten, merge, render
 
 from dettanode.track_io import (
@@ -453,7 +455,7 @@ def test_multi_audio_end_to_end(nodes, models_dir, make_audio, output_dir):
         {"model": transcriber_cfg, "thresholds": {"on_th": 0.25, "off_th": 0.3, "fr_th": 0.4, "fr_low_frames": 2, "on_nms": 3, "v2_th": 0.3}},
         LaneNet(**transcriber_cfg).state_dict(),
     )
-    wrapper = nodes.load_dettato("multi-pack", "cpu")
+    wrapper = nodes.load_dettato("multi-pack", "fp32", "cpu")
 
     a1 = make_audio(t=1.0, rate=44100, freq=440.0)
     a2 = make_audio(t=1.0, rate=44100, freq=220.0)
@@ -644,7 +646,7 @@ def test_transcribe_dedup_toggle(nodes, models_dir, make_audio):
                                                   "fr_low_frames": 2, "on_nms": 3, "v2_th": 0.3}},
         LaneNet(**transcriber_cfg).state_dict(),
     )
-    wrapper = nodes.load_dettato("dedup-pack", "cpu")
+    wrapper = nodes.load_dettato("dedup-pack", "fp32", "cpu")
     a1 = make_audio(t=1.0, rate=44100, freq=440.0)
     a2 = make_audio(t=1.0, rate=44100, freq=220.0)
     p_off, _ = nodes.DettatoTranscribe.execute(wrapper, {"audio_0": a1, "audio_1": a2}, 1).args
@@ -700,7 +702,7 @@ def test_transcribe_dedup_no_cross_stem_duplicates(nodes, models_dir, make_audio
                                                   "fr_low_frames": 2, "on_nms": 3, "v2_th": 0.3}},
         LaneNet(**transcriber_cfg).state_dict(),
     )
-    wrapper = nodes.load_dettato("dedup-inv", "cpu")
+    wrapper = nodes.load_dettato("dedup-inv", "fp32", "cpu")
     audios = {f"audio_{i}": make_audio(t=1.0, rate=44100, freq=f)
               for i, f in enumerate((440.0, 220.0, 330.0))}
     p, _ = nodes.DettatoTranscribe.execute(wrapper, audios, 1, True).args
@@ -762,7 +764,7 @@ def test_quantize_midi_node(nodes, models_dir, make_audio):
                                                   "fr_low_frames": 2, "on_nms": 3, "v2_th": 0.3}},
         LaneNet(**transcriber_cfg).state_dict(),
     )
-    wrapper = nodes.load_dettato("quant-pack", "cpu")
+    wrapper = nodes.load_dettato("quant-pack", "fp32", "cpu")
     audio = make_audio(t=1.0, rate=48000, freq=440.0)
     p_off, _ = nodes.DettatoTranscribe.execute(wrapper, {"audio_0": audio}, 1).args
     assert "quantize" not in p_off["info"]  # the transcribe keeps the performance timing

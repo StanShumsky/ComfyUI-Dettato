@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-dettato"
 description = "KobiMusic Dettato multi-instrument audio-to-MIDI nodes: a custom loader for the four 28.1M-parameter stage models (transcriber, evidence repairer, grouper, drums) loaded at their released fp32 precision, plus piano-roll previews, MIDI/JSON writers, and an adapter to the native YuE2 ABC score for ComfyUI's built-in YuE2 song generator."
-version = "0.3.0"
+version = "0.4.0"
 license = { file = "LICENSE" }
 dependencies = [
     "huggingface_hub>=1.0",
@@ -9,6 +9,7 @@ dependencies = [
     "soxr>=0.3",
     "scipy",
     "pretty_midi>=0.2",
+    "tqdm",
 ]
 classifiers = [
     "Operating System :: OS Independent",
@@ -23,6 +24,27 @@ Repository = "https://github.com/StanShumsky/ComfyUI-Dettato"
 PublisherId = "shumsky"
 DisplayName = "ComfyUI-Dettato"
 Icon = "https://raw.githubusercontent.com/StanShumsky/ComfyUI-Dettato/main/icon.png"
+# V3 nodes (comfy_api.latest) need >=0.3.48; the search_aliases field >=0.11.0;
+# the newest of the three is the real floor.
+requires-comfyui = ">=0.11.0"
+
+# Registry/manager-side model installation, alongside the in-node auto-download (the subfolder
+# name of each repo matches the stage layout the loader expects).
+[[tool.comfy.Models]]
+location = "dhetto"
+model_url = "https://huggingface.co/kobimusic/dhetto"
+
+[[tool.comfy.Models]]
+location = "dhetto"
+model_url = "https://huggingface.co/kobimusic/dhetto-evidence"
+
+[[tool.comfy.Models]]
+location = "dhetto"
+model_url = "https://huggingface.co/kobimusic/dhetto-grouper"
+
+[[tool.comfy.Models]]
+location = "dhetto"
+model_url = "https://huggingface.co/kobimusic/dhetto-drums"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

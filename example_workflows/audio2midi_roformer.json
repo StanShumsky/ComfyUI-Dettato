@@ -1,830 +1,831 @@
 {
- "id": "dettato-audio2midi-roformer",
- "revision": 0,
- "last_node_id": 18,
- "last_link_id": 21,
- "nodes": [
-  {
-   "id": 1,
-   "type": "MarkdownNote",
-   "pos": [
-    60,
-    60
-   ],
-   "size": [
-    400,
-    360
-   ],
-   "flags": {},
-   "order": 0,
-   "mode": 0,
-   "inputs": [],
-   "outputs": [],
-   "properties": {},
-   "widgets_values": [
-    "## Dettato \u2014 Separate to MIDI (Roformer 6-stem)\n\nFull separation-to-MIDI chain: **Load Audio \u2192 Roformer Separate** (the `sw-6stem` checkpoint: bass / drums / other / vocals / guitar / piano) **\u2192 six \u00d7 Roformer To Audio \u2192 Dettato Transcribe to MIDI \u2192 Save MIDI + Piano Roll**.\n\n- Each stem gets one **Roformer To Audio** node (the `stem` dropdown is narrowed to the model's six stems once the Separate node is connected); the six AUDIO outputs fill the Transcribe slots `audio_0`\u2026`audio_5` in any order you like.\n- The Dettato chain is **Loader \u2192 Evidence \u2192 Grouper \u2192 Drums**: a stage node not in the graph is bypassed, and its weights are never downloaded. The drums stage needs a 40 kHz or faster source \u2014 the separator's 44.1 kHz stems qualify.\n- Each source runs the full chain, its tracks merge in slot order (name collisions get 'Name (audio_N)'), and one General MIDI file is written \u2014 drum tracks included when the Drums stage is attached.\n- **Transcribe's `dedup` toggle is ON in this workflow**: when the same instrument was transcribed from several stems, only the stem with the most notes of it is kept before the merge, so no duplicate 'Drums (audio_N)' / 'Piano (audio_N)' tracks survive. For sources that are different recordings, turn it off.\n- The output is performance MIDI; if you want the notes to sit on the grid, run the `midi` output through a **Dettato Quantize MIDI** node (not in this graph) with the song's `tempo` and `grid`.\n- **Piano Roll** renders one lane per track (drums in the lower panel)"
-   ]
-  },
-  {
-   "id": 2,
-   "type": "RoformerLoader",
-   "pos": [
-    60,
-    480
-   ],
-   "size": [
-    320,
-    120
-   ],
-   "flags": {},
-   "order": 1,
-   "mode": 0,
-   "inputs": [],
-   "outputs": [
+  "id": "dettato-audio2midi-roformer",
+  "revision": 0,
+  "last_node_id": 18,
+  "last_link_id": 21,
+  "nodes": [
     {
-     "name": "model",
-     "type": "ROFORMER_MODEL",
-     "links": [
-      1
-     ]
-    }
-   ],
-   "properties": {},
-   "widgets_values": [
-    "sw-6stem",
-    "auto"
-   ]
-  },
-  {
-   "id": 3,
-   "type": "LoadAudio",
-   "pos": [
-    60,
-    660
-   ],
-   "size": [
-    320,
-    100
-   ],
-   "flags": {},
-   "order": 2,
-   "mode": 0,
-   "inputs": [],
-   "outputs": [
-    {
-     "name": "audio",
-     "type": "AUDIO",
-     "links": [
-      2
-     ]
-    }
-   ],
-   "properties": {},
-   "widgets_values": [
-    ""
-   ]
-  },
-  {
-   "id": 4,
-   "type": "RoformerSeparate",
-   "pos": [
-    460,
-    520
-   ],
-   "size": [
-    320,
-    140
-   ],
-   "flags": {},
-   "order": 3,
-   "mode": 0,
-   "inputs": [
-    {
-     "name": "model",
-     "type": "ROFORMER_MODEL",
-     "link": 1
+      "id": 1,
+      "type": "MarkdownNote",
+      "pos": [
+        60,
+        60
+      ],
+      "size": [
+        400,
+        360
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "## Dettato \u2014 Separate to MIDI (Roformer 6-stem)\n\nFull separation-to-MIDI chain: **Load Audio \u2192 Roformer Separate** (the `sw-6stem` checkpoint: bass / drums / other / vocals / guitar / piano) **\u2192 six \u00d7 Roformer To Audio \u2192 Dettato Transcribe to MIDI \u2192 Save MIDI + Piano Roll**.\n\n- Each stem gets one **Roformer To Audio** node (the `stem` dropdown is narrowed to the model's six stems once the Separate node is connected); the six AUDIO outputs fill the Transcribe slots `audio_0`\u2026`audio_5` in any order you like.\n- The Dettato chain is **Loader \u2192 Evidence \u2192 Grouper \u2192 Drums**: a stage node not in the graph is bypassed, and its weights are never downloaded. The drums stage needs a 40 kHz or faster source \u2014 the separator's 44.1 kHz stems qualify.\n- Each source runs the full chain, its tracks merge in slot order (name collisions get 'Name (audio_N)'), and one General MIDI file is written \u2014 drum tracks included when the Drums stage is attached.\n- **Transcribe's `dedup` toggle is ON in this workflow**: when the same instrument was transcribed from several stems, only the stem with the most notes of it is kept before the merge, so no duplicate 'Drums (audio_N)' / 'Piano (audio_N)' tracks survive. For sources that are different recordings, turn it off.\n- The output is performance MIDI; if you want the notes to sit on the grid, run the `midi` output through a **Dettato Quantize MIDI** node (not in this graph) with the song's `tempo` and `grid`.\n- **Piano Roll** renders one lane per track (drums in the lower panel)"
+      ]
     },
     {
-     "name": "audio",
-     "type": "AUDIO",
-     "link": 2
-    }
-   ],
-   "outputs": [
+      "id": 2,
+      "type": "RoformerLoader",
+      "pos": [
+        60,
+        480
+      ],
+      "size": [
+        320,
+        120
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "ROFORMER_MODEL",
+          "links": [
+            1
+          ]
+        }
+      ],
+      "properties": {},
+      "widgets_values": [
+        "sw-6stem",
+        "auto"
+      ]
+    },
     {
-     "name": "stems",
-     "type": "ROFORMER_STEMS",
-     "links": [
+      "id": 3,
+      "type": "LoadAudio",
+      "pos": [
+        60,
+        660
+      ],
+      "size": [
+        320,
+        100
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            2
+          ]
+        }
+      ],
+      "properties": {},
+      "widgets_values": [
+        ""
+      ]
+    },
+    {
+      "id": 4,
+      "type": "RoformerSeparate",
+      "pos": [
+        460,
+        520
+      ],
+      "size": [
+        320,
+        140
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "ROFORMER_MODEL",
+          "link": 1
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 2
+        }
+      ],
+      "outputs": [
+        {
+          "name": "stems",
+          "type": "ROFORMER_STEMS",
+          "links": [
+            3,
+            4,
+            5,
+            6,
+            7,
+            8
+          ]
+        },
+        {
+          "name": "target",
+          "type": "AUDIO",
+          "links": null
+        },
+        {
+          "name": "other",
+          "type": "AUDIO",
+          "links": null
+        },
+        {
+          "name": "info_json",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {},
+      "widgets_values": [
+        0
+      ]
+    },
+    {
+      "id": 9,
+      "type": "RoformerToAudio",
+      "pos": [
+        860,
+        60
+      ],
+      "size": [
+        320,
+        80
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "stems",
+          "type": "ROFORMER_STEMS",
+          "link": 3
+        }
+      ],
+      "outputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            13
+          ]
+        }
+      ],
+      "properties": {},
+      "widgets_values": [
+        "bass"
+      ]
+    },
+    {
+      "id": 10,
+      "type": "RoformerToAudio",
+      "pos": [
+        860,
+        170
+      ],
+      "size": [
+        320,
+        80
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "stems",
+          "type": "ROFORMER_STEMS",
+          "link": 4
+        }
+      ],
+      "outputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            14
+          ]
+        }
+      ],
+      "properties": {},
+      "widgets_values": [
+        "drums"
+      ]
+    },
+    {
+      "id": 11,
+      "type": "RoformerToAudio",
+      "pos": [
+        860,
+        280
+      ],
+      "size": [
+        320,
+        80
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "stems",
+          "type": "ROFORMER_STEMS",
+          "link": 5
+        }
+      ],
+      "outputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            15
+          ]
+        }
+      ],
+      "properties": {},
+      "widgets_values": [
+        "other"
+      ]
+    },
+    {
+      "id": 12,
+      "type": "RoformerToAudio",
+      "pos": [
+        860,
+        390
+      ],
+      "size": [
+        320,
+        80
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "stems",
+          "type": "ROFORMER_STEMS",
+          "link": 6
+        }
+      ],
+      "outputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            16
+          ]
+        }
+      ],
+      "properties": {},
+      "widgets_values": [
+        "vocals"
+      ]
+    },
+    {
+      "id": 13,
+      "type": "RoformerToAudio",
+      "pos": [
+        860,
+        500
+      ],
+      "size": [
+        320,
+        80
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "stems",
+          "type": "ROFORMER_STEMS",
+          "link": 7
+        }
+      ],
+      "outputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            17
+          ]
+        }
+      ],
+      "properties": {},
+      "widgets_values": [
+        "guitar"
+      ]
+    },
+    {
+      "id": 14,
+      "type": "RoformerToAudio",
+      "pos": [
+        860,
+        610
+      ],
+      "size": [
+        320,
+        80
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "stems",
+          "type": "ROFORMER_STEMS",
+          "link": 8
+        }
+      ],
+      "outputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            18
+          ]
+        }
+      ],
+      "properties": {},
+      "widgets_values": [
+        "piano"
+      ]
+    },
+    {
+      "id": 5,
+      "type": "DettatoLoader",
+      "pos": [
+        860,
+        760
+      ],
+      "size": [
+        320,
+        120
+      ],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "DETTATO_MODEL",
+          "links": [
+            9
+          ]
+        }
+      ],
+      "properties": {},
+      "widgets_values": [
+        "dettato",
+        "auto",
+        "auto"
+      ]
+    },
+    {
+      "id": 6,
+      "type": "DettatoEvidence",
+      "pos": [
+        1240,
+        760
+      ],
+      "size": [
+        300,
+        60
+      ],
+      "flags": {},
+      "order": 15,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "DETTATO_MODEL",
+          "link": 9
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "DETTATO_MODEL",
+          "links": [
+            10
+          ]
+        }
+      ],
+      "properties": {},
+      "widgets_values": []
+    },
+    {
+      "id": 7,
+      "type": "DettatoGrouper",
+      "pos": [
+        1240,
+        850
+      ],
+      "size": [
+        300,
+        60
+      ],
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "DETTATO_MODEL",
+          "link": 10
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "DETTATO_MODEL",
+          "links": [
+            11
+          ]
+        }
+      ],
+      "properties": {},
+      "widgets_values": []
+    },
+    {
+      "id": 8,
+      "type": "DettatoDrums",
+      "pos": [
+        1240,
+        940
+      ],
+      "size": [
+        300,
+        60
+      ],
+      "flags": {},
+      "order": 17,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "DETTATO_MODEL",
+          "link": 11
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "DETTATO_MODEL",
+          "links": [
+            12
+          ]
+        }
+      ],
+      "properties": {},
+      "widgets_values": []
+    },
+    {
+      "id": 15,
+      "type": "DettatoTranscribe",
+      "pos": [
+        1620,
+        480
+      ],
+      "size": [
+        320,
+        170
+      ],
+      "flags": {},
+      "order": 18,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "DETTATO_MODEL",
+          "link": 12
+        },
+        {
+          "name": "audios.audio_0",
+          "type": "AUDIO",
+          "link": 13
+        },
+        {
+          "name": "audios.audio_1",
+          "type": "AUDIO",
+          "link": 14
+        },
+        {
+          "name": "audios.audio_2",
+          "type": "AUDIO",
+          "link": 15
+        },
+        {
+          "name": "audios.audio_3",
+          "type": "AUDIO",
+          "link": 16
+        },
+        {
+          "name": "audios.audio_4",
+          "type": "AUDIO",
+          "link": 17
+        },
+        {
+          "name": "audios.audio_5",
+          "type": "AUDIO",
+          "link": 18
+        }
+      ],
+      "outputs": [
+        {
+          "name": "midi",
+          "type": "DETTATO_MIDI",
+          "links": [
+            25,
+            26
+          ]
+        },
+        {
+          "name": "info_json",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {},
+      "widgets_values": [
+        1,
+        true
+      ]
+    },
+    {
+      "id": 16,
+      "type": "DettatoPianoRoll",
+      "pos": [
+        2020,
+        420
+      ],
+      "size": [
+        320,
+        130
+      ],
+      "flags": {},
+      "order": 19,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "midi",
+          "type": "DETTATO_MIDI,DETTATO_TRACKS",
+          "link": 25
+        }
+      ],
+      "outputs": [
+        {
+          "name": "piano_roll",
+          "type": "IMAGE",
+          "links": [
+            21
+          ]
+        }
+      ],
+      "properties": {},
+      "widgets_values": [
+        0.0,
+        0,
+        true
+      ]
+    },
+    {
+      "id": 17,
+      "type": "PreviewImage",
+      "pos": [
+        2400,
+        420
+      ],
+      "size": [
+        340,
+        260
+      ],
+      "flags": {},
+      "order": 20,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 21
+        }
+      ],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": []
+    },
+    {
+      "id": 18,
+      "type": "DettatoSaveMIDI",
+      "pos": [
+        2020,
+        620
+      ],
+      "size": [
+        320,
+        80
+      ],
+      "flags": {},
+      "order": 21,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "midi",
+          "type": "DETTATO_MIDI,DETTATO_TRACKS",
+          "link": 26
+        }
+      ],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "dettato/midi"
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      2,
+      0,
+      4,
+      0,
+      "ROFORMER_MODEL"
+    ],
+    [
+      2,
+      3,
+      0,
+      4,
+      1,
+      "AUDIO"
+    ],
+    [
       3,
       4,
+      0,
+      9,
+      0,
+      "ROFORMER_STEMS"
+    ],
+    [
+      4,
+      4,
+      0,
+      10,
+      0,
+      "ROFORMER_STEMS"
+    ],
+    [
       5,
+      4,
+      0,
+      11,
+      0,
+      "ROFORMER_STEMS"
+    ],
+    [
       6,
+      4,
+      0,
+      12,
+      0,
+      "ROFORMER_STEMS"
+    ],
+    [
       7,
-      8
-     ]
-    },
-    {
-     "name": "target",
-     "type": "AUDIO",
-     "links": null
-    },
-    {
-     "name": "other",
-     "type": "AUDIO",
-     "links": null
-    },
-    {
-     "name": "info_json",
-     "type": "STRING",
-     "links": null
-    }
-   ],
-   "properties": {},
-   "widgets_values": [
-    0
-   ]
-  },
-  {
-   "id": 9,
-   "type": "RoformerToAudio",
-   "pos": [
-    860,
-    60
-   ],
-   "size": [
-    320,
-    80
-   ],
-   "flags": {},
-   "order": 8,
-   "mode": 0,
-   "inputs": [
-    {
-     "name": "stems",
-     "type": "ROFORMER_STEMS",
-     "link": 3
-    }
-   ],
-   "outputs": [
-    {
-     "name": "audio",
-     "type": "AUDIO",
-     "links": [
-      13
-     ]
-    }
-   ],
-   "properties": {},
-   "widgets_values": [
-    "bass"
-   ]
-  },
-  {
-   "id": 10,
-   "type": "RoformerToAudio",
-   "pos": [
-    860,
-    170
-   ],
-   "size": [
-    320,
-    80
-   ],
-   "flags": {},
-   "order": 9,
-   "mode": 0,
-   "inputs": [
-    {
-     "name": "stems",
-     "type": "ROFORMER_STEMS",
-     "link": 4
-    }
-   ],
-   "outputs": [
-    {
-     "name": "audio",
-     "type": "AUDIO",
-     "links": [
-      14
-     ]
-    }
-   ],
-   "properties": {},
-   "widgets_values": [
-    "drums"
-   ]
-  },
-  {
-   "id": 11,
-   "type": "RoformerToAudio",
-   "pos": [
-    860,
-    280
-   ],
-   "size": [
-    320,
-    80
-   ],
-   "flags": {},
-   "order": 10,
-   "mode": 0,
-   "inputs": [
-    {
-     "name": "stems",
-     "type": "ROFORMER_STEMS",
-     "link": 5
-    }
-   ],
-   "outputs": [
-    {
-     "name": "audio",
-     "type": "AUDIO",
-     "links": [
-      15
-     ]
-    }
-   ],
-   "properties": {},
-   "widgets_values": [
-    "other"
-   ]
-  },
-  {
-   "id": 12,
-   "type": "RoformerToAudio",
-   "pos": [
-    860,
-    390
-   ],
-   "size": [
-    320,
-    80
-   ],
-   "flags": {},
-   "order": 11,
-   "mode": 0,
-   "inputs": [
-    {
-     "name": "stems",
-     "type": "ROFORMER_STEMS",
-     "link": 6
-    }
-   ],
-   "outputs": [
-    {
-     "name": "audio",
-     "type": "AUDIO",
-     "links": [
-      16
-     ]
-    }
-   ],
-   "properties": {},
-   "widgets_values": [
-    "vocals"
-   ]
-  },
-  {
-   "id": 13,
-   "type": "RoformerToAudio",
-   "pos": [
-    860,
-    500
-   ],
-   "size": [
-    320,
-    80
-   ],
-   "flags": {},
-   "order": 12,
-   "mode": 0,
-   "inputs": [
-    {
-     "name": "stems",
-     "type": "ROFORMER_STEMS",
-     "link": 7
-    }
-   ],
-   "outputs": [
-    {
-     "name": "audio",
-     "type": "AUDIO",
-     "links": [
-      17
-     ]
-    }
-   ],
-   "properties": {},
-   "widgets_values": [
-    "guitar"
-   ]
-  },
-  {
-   "id": 14,
-   "type": "RoformerToAudio",
-   "pos": [
-    860,
-    610
-   ],
-   "size": [
-    320,
-    80
-   ],
-   "flags": {},
-   "order": 13,
-   "mode": 0,
-   "inputs": [
-    {
-     "name": "stems",
-     "type": "ROFORMER_STEMS",
-     "link": 8
-    }
-   ],
-   "outputs": [
-    {
-     "name": "audio",
-     "type": "AUDIO",
-     "links": [
-      18
-     ]
-    }
-   ],
-   "properties": {},
-   "widgets_values": [
-    "piano"
-   ]
-  },
-  {
-   "id": 5,
-   "type": "DettatoLoader",
-   "pos": [
-    860,
-    760
-   ],
-   "size": [
-    320,
-    120
-   ],
-   "flags": {},
-   "order": 14,
-   "mode": 0,
-   "inputs": [],
-   "outputs": [
-    {
-     "name": "model",
-     "type": "DETTATO_MODEL",
-     "links": [
-      9
-     ]
-    }
-   ],
-   "properties": {},
-   "widgets_values": [
-    "dettato",
-    "auto"
-   ]
-  },
-  {
-   "id": 6,
-   "type": "DettatoEvidence",
-   "pos": [
-    1240,
-    760
-   ],
-   "size": [
-    300,
-    60
-   ],
-   "flags": {},
-   "order": 15,
-   "mode": 0,
-   "inputs": [
-    {
-     "name": "model",
-     "type": "DETTATO_MODEL",
-     "link": 9
-    }
-   ],
-   "outputs": [
-    {
-     "name": "model",
-     "type": "DETTATO_MODEL",
-     "links": [
-      10
-     ]
-    }
-   ],
-   "properties": {},
-   "widgets_values": []
-  },
-  {
-   "id": 7,
-   "type": "DettatoGrouper",
-   "pos": [
-    1240,
-    850
-   ],
-   "size": [
-    300,
-    60
-   ],
-   "flags": {},
-   "order": 16,
-   "mode": 0,
-   "inputs": [
-    {
-     "name": "model",
-     "type": "DETTATO_MODEL",
-     "link": 10
-    }
-   ],
-   "outputs": [
-    {
-     "name": "model",
-     "type": "DETTATO_MODEL",
-     "links": [
-      11
-     ]
-    }
-   ],
-   "properties": {},
-   "widgets_values": []
-  },
-  {
-   "id": 8,
-   "type": "DettatoDrums",
-   "pos": [
-    1240,
-    940
-   ],
-   "size": [
-    300,
-    60
-   ],
-   "flags": {},
-   "order": 17,
-   "mode": 0,
-   "inputs": [
-    {
-     "name": "model",
-     "type": "DETTATO_MODEL",
-     "link": 11
-    }
-   ],
-   "outputs": [
-    {
-     "name": "model",
-     "type": "DETTATO_MODEL",
-     "links": [
-      12
-     ]
-    }
-   ],
-   "properties": {},
-   "widgets_values": []
-  },
-  {
-   "id": 15,
-   "type": "DettatoTranscribe",
-   "pos": [
-    1620,
-    480
-   ],
-   "size": [
-    320,
-    170
-   ],
-   "flags": {},
-   "order": 18,
-   "mode": 0,
-   "inputs": [
-    {
-     "name": "model",
-     "type": "DETTATO_MODEL",
-     "link": 12
-    },
-    {
-     "name": "audios.audio_0",
-     "type": "AUDIO",
-     "link": 13
-    },
-    {
-     "name": "audios.audio_1",
-     "type": "AUDIO",
-     "link": 14
-    },
-    {
-     "name": "audios.audio_2",
-     "type": "AUDIO",
-     "link": 15
-    },
-    {
-     "name": "audios.audio_3",
-     "type": "AUDIO",
-     "link": 16
-    },
-    {
-     "name": "audios.audio_4",
-     "type": "AUDIO",
-     "link": 17
-    },
-    {
-     "name": "audios.audio_5",
-     "type": "AUDIO",
-     "link": 18
-    }
-   ],
-   "outputs": [
-    {
-     "name": "midi",
-     "type": "DETTATO_MIDI",
-     "links": [
+      4,
+      0,
+      13,
+      0,
+      "ROFORMER_STEMS"
+    ],
+    [
+      8,
+      4,
+      0,
+      14,
+      0,
+      "ROFORMER_STEMS"
+    ],
+    [
+      9,
+      5,
+      0,
+      6,
+      0,
+      "DETTATO_MODEL"
+    ],
+    [
+      10,
+      6,
+      0,
+      7,
+      0,
+      "DETTATO_MODEL"
+    ],
+    [
+      11,
+      7,
+      0,
+      8,
+      0,
+      "DETTATO_MODEL"
+    ],
+    [
+      12,
+      8,
+      0,
+      15,
+      0,
+      "DETTATO_MODEL"
+    ],
+    [
+      13,
+      9,
+      0,
+      15,
+      1,
+      "AUDIO"
+    ],
+    [
+      14,
+      10,
+      0,
+      15,
+      2,
+      "AUDIO"
+    ],
+    [
+      15,
+      11,
+      0,
+      15,
+      3,
+      "AUDIO"
+    ],
+    [
+      16,
+      12,
+      0,
+      15,
+      4,
+      "AUDIO"
+    ],
+    [
+      17,
+      13,
+      0,
+      15,
+      5,
+      "AUDIO"
+    ],
+    [
+      18,
+      14,
+      0,
+      15,
+      6,
+      "AUDIO"
+    ],
+    [
+      21,
+      16,
+      0,
+      17,
+      0,
+      "IMAGE"
+    ],
+    [
       25,
-      26
-     ]
-    },
-    {
-     "name": "info_json",
-     "type": "STRING",
-     "links": null
+      15,
+      0,
+      16,
+      0,
+      "DETTATO_MIDI"
+    ],
+    [
+      26,
+      15,
+      0,
+      18,
+      0,
+      "DETTATO_MIDI"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 1,
+      "offset": [
+        0,
+        0
+      ]
     }
-   ],
-   "properties": {},
-   "widgets_values": [
-    1,
-    true
-   ]
   },
-  {
-   "id": 16,
-   "type": "DettatoPianoRoll",
-   "pos": [
-    2020,
-    420
-   ],
-   "size": [
-    320,
-    130
-   ],
-   "flags": {},
-   "order": 19,
-   "mode": 0,
-   "inputs": [
-    {
-     "name": "midi",
-     "type": "DETTATO_MIDI,DETTATO_TRACKS",
-     "link": 25
-    }
-   ],
-   "outputs": [
-    {
-     "name": "piano_roll",
-     "type": "IMAGE",
-     "links": [
-      21
-     ]
-    }
-   ],
-   "properties": {},
-   "widgets_values": [
-    0.0,
-    0,
-    true
-   ]
-  },
-  {
-   "id": 17,
-   "type": "PreviewImage",
-   "pos": [
-    2400,
-    420
-   ],
-   "size": [
-    340,
-    260
-   ],
-   "flags": {},
-   "order": 20,
-   "mode": 0,
-   "inputs": [
-    {
-     "name": "images",
-     "type": "IMAGE",
-     "link": 21
-    }
-   ],
-   "outputs": [],
-   "properties": {},
-   "widgets_values": []
-  },
-  {
-   "id": 18,
-   "type": "DettatoSaveMIDI",
-   "pos": [
-    2020,
-    620
-   ],
-   "size": [
-    320,
-    80
-   ],
-   "flags": {},
-   "order": 21,
-   "mode": 0,
-   "inputs": [
-    {
-     "name": "midi",
-     "type": "DETTATO_MIDI,DETTATO_TRACKS",
-     "link": 26
-    }
-   ],
-   "outputs": [],
-   "properties": {},
-   "widgets_values": [
-    "dettato/midi"
-   ]
-  }
- ],
- "links": [
-  [
-   1,
-   2,
-   0,
-   4,
-   0,
-   "ROFORMER_MODEL"
-  ],
-  [
-   2,
-   3,
-   0,
-   4,
-   1,
-   "AUDIO"
-  ],
-  [
-   3,
-   4,
-   0,
-   9,
-   0,
-   "ROFORMER_STEMS"
-  ],
-  [
-   4,
-   4,
-   0,
-   10,
-   0,
-   "ROFORMER_STEMS"
-  ],
-  [
-   5,
-   4,
-   0,
-   11,
-   0,
-   "ROFORMER_STEMS"
-  ],
-  [
-   6,
-   4,
-   0,
-   12,
-   0,
-   "ROFORMER_STEMS"
-  ],
-  [
-   7,
-   4,
-   0,
-   13,
-   0,
-   "ROFORMER_STEMS"
-  ],
-  [
-   8,
-   4,
-   0,
-   14,
-   0,
-   "ROFORMER_STEMS"
-  ],
-  [
-   9,
-   5,
-   0,
-   6,
-   0,
-   "DETTATO_MODEL"
-  ],
-  [
-   10,
-   6,
-   0,
-   7,
-   0,
-   "DETTATO_MODEL"
-  ],
-  [
-   11,
-   7,
-   0,
-   8,
-   0,
-   "DETTATO_MODEL"
-  ],
-  [
-   12,
-   8,
-   0,
-   15,
-   0,
-   "DETTATO_MODEL"
-  ],
-  [
-   13,
-   9,
-   0,
-   15,
-   1,
-   "AUDIO"
-  ],
-  [
-   14,
-   10,
-   0,
-   15,
-   2,
-   "AUDIO"
-  ],
-  [
-   15,
-   11,
-   0,
-   15,
-   3,
-   "AUDIO"
-  ],
-  [
-   16,
-   12,
-   0,
-   15,
-   4,
-   "AUDIO"
-  ],
-  [
-   17,
-   13,
-   0,
-   15,
-   5,
-   "AUDIO"
-  ],
-  [
-   18,
-   14,
-   0,
-   15,
-   6,
-   "AUDIO"
-  ],
-  [
-   21,
-   16,
-   0,
-   17,
-   0,
-   "IMAGE"
-  ],
-  [
-   25,
-   15,
-   0,
-   16,
-   0,
-   "DETTATO_MIDI"
-  ],
-  [
-   26,
-   15,
-   0,
-   18,
-   0,
-   "DETTATO_MIDI"
-  ]
- ],
- "groups": [],
- "config": {},
- "extra": {
-  "ds": {
-   "scale": 1,
-   "offset": [
-    0,
-    0
-   ]
-  }
- },
- "version": 0.4
+  "version": 0.4
 }

@@ -3,3 +3,4 @@ safetensors
 soxr>=0.3
 scipy
 pretty_midi>=0.2
+tqdm

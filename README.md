@@ -6,8 +6,11 @@ with vocals - and it writes a MIDI file with one track per instrument. Tracks ar
 73 instrument classes, each with a General MIDI program, plus a `Drums` track covering drum
 kits and orchestral percussion, with timpani written at their pitch.
 
-The whole chain is small: 28.1 M parameters, 113 MB in float32 - the precision the models were
-released at, with nothing to configure. For comparison, the next-best open transcriber
+The whole chain is small: 28.1 M parameters - 113 MB in float32 (about half that in
+bf16/fp16), and it runs at whatever precision you pick (the default follows
+ComfyUI's session dtype, with fp32 as the released option). For comparison, the
+next-best open transcriber (MuScriptor) has 1.3 B parameters, and dettato
+outperforms it at about 1/65th the size.
 (MuScriptor) has 1.3 B parameters, and dettato outperforms it at about 1/65th the size.
 
 The pack also drives ComfyUI's built-in YuE2 song generator: the **Dettato To YuE2 ABC** node
@@ -98,8 +101,17 @@ Loads the transcriber - the first stage, always on.
   `models/dettato` that holds stage subfolders (`dettato/`, `dettato-evidence/`,
   `dettato-grouper/`, `dettato-drums/`, each with `config.json` + `model.safetensors`). It
   must at least hold the transcriber.
-- `device`: `auto` (ComfyUI's device), `cuda`, `mps`, `cpu`.
+- `precision`: `auto` (ComfyUI's session dtype - fp16 on CUDA, fp32 on CPU), `bf16`,
+  `fp16` (half the weight memory), `fp32` (the released precision).
+- `device`: `auto` (ComfyUI's device policy for auxiliary models - honors `--gpu-only`,
+  falls back to the CPU on machines without usable VRAM), `cuda`, `mps`, `cpu`.
 
+
+The weights ride in RAM and occupy the GPU only while a run is in progress -
+ComfyUI's model management evicts them when other nodes need the VRAM, so the
+chain composes with sampler and separation models. A transcription that runs
+out of memory is retried once at half the window batch before raising an
+actionable error.
 ### Dettato Evidence
 
 Attaches the evidence stage: the transcriber's notes are re-checked against its own frame

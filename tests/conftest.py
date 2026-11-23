@@ -116,6 +116,7 @@ def _install_comfy_api_stub() -> None:
     )
     latest = types.ModuleType("comfy_api.latest")
     latest.io = io
+    latest.ui = types.SimpleNamespace(PreviewImage=lambda image, cls=None: image)
     latest.ComfyExtension = type("ComfyExtension", (), {})
     comfy_api = types.ModuleType("comfy_api")
     comfy_api.latest = latest
@@ -153,7 +154,20 @@ def _install_stubs() -> None:
     mm.get_torch_device = lambda: torch.device(
         "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     )
+    mm.text_encoder_device = mm.get_torch_device
+    mm.text_encoder_offload_device = lambda: torch.device("cpu")
+    mm.text_encoder_dtype = lambda device: torch.float16
+    mm.load_model_gpu = lambda patcher: None
     mm.soft_empty_cache = lambda: None
+    mp = types.ModuleType("comfy.model_patcher")
+
+    class CoreModelPatcher:
+        def __init__(self, model, load_device, offload_device):
+            self.model = model
+            self.load_device = load_device
+            self.offload_device = offload_device
+
+    mp.CoreModelPatcher = CoreModelPatcher
     cu = types.ModuleType("comfy.utils")
 
     class ProgressBar:
@@ -166,9 +180,11 @@ def _install_stubs() -> None:
 
     cu.ProgressBar = ProgressBar
     comfy.model_management = mm
+    comfy.model_patcher = mp
     comfy.utils = cu
     sys.modules["comfy"] = comfy
     sys.modules["comfy.model_management"] = mm
+    sys.modules["comfy.model_patcher"] = mp
     sys.modules["comfy.utils"] = cu
 
 

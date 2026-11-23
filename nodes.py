@@ -7,7 +7,7 @@ the notes into instrument-named tracks, and a 5.0 M model writes the drums (sour
 loaders do not know, so this pack ships a custom loader: the Loader node loads the transcriber,
 and the Evidence / Grouper / Drums nodes attach the optional stages — each downloading its own
 weights from Hugging Face on first use (or reading them from a local collection folder).
-Everything runs at the released float32 precision. Transcribe takes up to nine audio sources -
+Transcribe takes up to nine audio sources -
 any audio: files, stems from a separation pack, a video's audio track - and merges their tracks
 into one .mid.
 """
@@ -22,10 +22,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from safetensors.torch import load_file
+from safetensors.torch import safe_open
+from tqdm.auto import tqdm
 
 import folder_paths
 import comfy.model_management as mm
+import comfy.model_patcher
 from comfy.utils import ProgressBar
 
 from .dettato.audio import Audio
@@ -54,10 +56,12 @@ from .track_io import (
     summary_json,
 )
 
-from comfy_api.latest import io
+from comfy_api.latest import io, ui
 
 DETTATO_MODEL = io.Custom("DETTATO_MODEL")
 DETTATO_MIDI = io.Custom("DETTATO_MIDI")
+
+DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 # The consumers accept both the merged payload and the legacy bare-tracks payload, so graphs
 # built against older pack versions keep validating.
 DETTATO_PAYLOAD = io.Custom("DETTATO_MIDI,DETTATO_TRACKS")
@@ -156,9 +160,19 @@ def _download_stage(stage: str, root: Path, force: bool = False) -> Path:
     return target
 
 
-def _load_stage_state(stage_dir: Path) -> tuple[dict, dict[str, torch.Tensor]]:
+def _load_stage_state(stage_dir: Path, dtype: torch.dtype) -> tuple[dict, dict[str, torch.Tensor]]:
+    """The stage's config and weights read straight into ``dtype`` (no fp32 copy in RAM).
+
+    The native ComfyUI model loaders build the model in the compute dtype on the offload
+    device; the fp32 file contents are read from the memory map and converted tensor by
+    tensor instead of being resident a second time.
+    """
     config = json.loads((stage_dir / "config.json").read_text())
-    return config, load_file(str(stage_dir / "model.safetensors"))
+    state: dict[str, torch.Tensor] = {}
+    with safe_open(str(stage_dir / "model.safetensors"), framework="pt") as f:
+        for key in f.keys():
+            state[key] = f.get_tensor(key).to(dtype)
+    return config, state
 
 
 def _check_weights(state_dict: dict[str, torch.Tensor], name: str) -> None:
@@ -187,7 +201,8 @@ def _check_weights(state_dict: dict[str, torch.Tensor], name: str) -> None:
         )
 
 
-def _load_stage_verified(stage: str, root: Path, allow_download: bool) -> tuple[dict, dict[str, torch.Tensor]]:
+def _load_stage_verified(stage: str, root: Path, allow_download: bool,
+                         dtype: torch.dtype) -> tuple[dict, dict[str, torch.Tensor]]:
     """Load one stage from ``root``; with allow_download, fetch it from the Hub and retry once on a bad file."""
     last_error: Exception | None = None
     for attempt in range(2):
@@ -195,7 +210,7 @@ def _load_stage_verified(stage: str, root: Path, allow_download: bool) -> tuple[
             break
         target = _download_stage(stage, root, force=attempt == 1)
         try:
-            config, state = _load_stage_state(target)
+            config, state = _load_stage_state(target, dtype)
             _check_weights(state, STAGE_DIRS[stage])
             return config, state
         except Exception as error:  # a truncated safetensors raises its own error type
@@ -233,19 +248,22 @@ def _resolve_root(name: str) -> Path:
     return root
 
 
-def _load_stage(stage: str, name: str) -> tuple[dict, dict[str, torch.Tensor]]:
+def _load_stage(stage: str, name: str, dtype: torch.dtype) -> tuple[dict, dict[str, torch.Tensor]]:
     """One stage's (config, state dict) from the model's root; 'dettato' downloads it from the Hub."""
     root = _resolve_root(name)
     if name != "dettato" and stage not in _stage_files(root):
         raise FileNotFoundError(
             f"Collection {name!r} lacks stage {STAGE_DIRS[stage]}/; it has: {sorted(_stage_files(root))}."
         )
-    return _load_stage_verified(stage, root, allow_download=(name == "dettato"))
+    return _load_stage_verified(stage, root, allow_download=(name == "dettato"), dtype=dtype)
 
 
-def _build_stage(stage: str, config: dict, state: dict[str, torch.Tensor], device: torch.device):
+def _build_stage(stage: str, config: dict, state: dict[str, torch.Tensor],
+                 device: torch.device, dtype: torch.dtype):
+    """Build one stage's net in the compute dtype on the device (the native pattern: the model
+    is built in the compute dtype, never in fp32)."""
     if stage == "evidence":
-        model = Repairer(**config["model"])
+        model = Repairer(**config["model"]).to(dtype)
         model.load_state_dict(state, strict=True)
         return EvidenceRepairer(model, config["keep_th"], config["insert_th"], device)
     if stage == "grouper":
@@ -254,7 +272,7 @@ def _build_stage(stage: str, config: dict, state: dict[str, torch.Tensor], devic
                 f"{STAGE_DIRS[stage]}: the instrument list of the weights does not match this pack; "
                 "the weights are for a different dettato release."
             )
-        model = NoteNet(**config["model"])
+        model = NoteNet(**config["model"]).to(dtype)
         model.load_state_dict(state, strict=True)
         return Grouper(model, config, device)
     if stage == "drums":
@@ -262,23 +280,74 @@ def _build_stage(stage: str, config: dict, state: dict[str, torch.Tensor], devic
     raise ValueError(f"unknown stage {stage!r}")
 
 
-def load_dettato(name: str, device: str) -> dict:
+class DettatoStages(torch.nn.Module):
+    """The nn.Module facade over the attached stage nets, so ComfyUI's model management
+    can move the whole collection between the load and offload devices.
+
+    The stage wrappers (Transcriber, EvidenceRepairer, …) keep references to these same
+    modules: moving this module moves their weights, and their ``device`` attributes are
+    re-synced at the start of every run.
+    """
+
+    def __init__(self, transcriber: Transcriber):
+        super().__init__()
+        self.transcriber = transcriber.model
+        self.evidence = None
+        self.grouper = None
+        self.drums_kit = None
+        self.drums_experts = torch.nn.ModuleList()
+
+    def attach(self, stage: str, wrapper) -> None:
+        if stage == "evidence":
+            self.evidence = wrapper.model
+        elif stage == "grouper":
+            self.grouper = wrapper.model
+        elif stage == "drums":
+            self.drums_kit = wrapper.kit
+            self.drums_experts = torch.nn.ModuleList(wrapper.experts)
+
+
+def load_dettato(name: str, precision: str, device: str) -> dict:
     """The model payload: the transcriber (always); the optional stages attach via the stage nodes."""
     if device == "auto":
-        torch_device = mm.get_torch_device()
+        # The native ComfyUI device policy for auxiliary models: honors --gpu-only, aimdo and
+        # the session VRAM state (a NO_VRAM session runs the model on the CPU).
+        load_device = mm.text_encoder_device()
+        offload_device = mm.text_encoder_offload_device()
     else:
-        torch_device = torch.device(device)
-    config, state = _load_stage("transcriber", name)
-    model = LaneNet(**config["model"])
+        load_device = torch.device(device)
+        offload_device = torch.device("cpu")
+    if precision == "auto":
+        # ComfyUI's session dtype for auxiliary models (fp16 on CUDA by default; honors
+        # --fp16-text-enc & friends). CPU stays fp32: half-precision autocast is much slower
+        # there.
+        precision = (
+            "fp32" if load_device.type == "cpu"
+            else "bf16" if mm.text_encoder_dtype(load_device) == torch.bfloat16 else "fp16"
+        )
+    dtype = DTYPES[precision]
+    config, state = _load_stage("transcriber", name, dtype)
+    model = LaneNet(**config["model"]).to(dtype)
     model.load_state_dict(state, strict=True)
-    transcriber = Transcriber(model, config["thresholds"], torch_device)
-    LOGGER.info("Dettato: loaded the transcriber (%s) in fp32 on %s.", name, torch_device)
+    transcriber = Transcriber(model, config["thresholds"], offload_device)
+    # Build in system RAM and hand the weights to ComfyUI's model management (the native
+    # pattern for auxiliary models): the model rides in the offload device until a run loads
+    # it onto the GPU, and is evicted again when other nodes need the VRAM.
+    stages = DettatoStages(transcriber)
+    patcher = comfy.model_patcher.CoreModelPatcher(stages, load_device, offload_device)
+    LOGGER.info(
+        "Dettato: loaded the transcriber (%s) in %s (load %s, offload %s).",
+        name, precision, load_device, offload_device,
+    )
     return {
         "transcriber": transcriber,
         "evidence": None,
         "grouper": None,
         "drums": None,
-        "device": torch_device,
+        "stages": stages,
+        "patcher": patcher,
+        "device": load_device,
+        "dtype": dtype,
         "name": name,
     }
 
@@ -286,16 +355,27 @@ def load_dettato(name: str, device: str) -> dict:
 # --------------------------------------------------------------------- transcription
 
 
-def run_transcription(wrapper: dict, audio: dict, progress: ProgressBar | None = None) -> dict:
+def run_transcription(wrapper: dict, audio: dict, progress: ProgressBar | None = None,
+                      batch: int = 2, tqdm_bar=None) -> dict:
     """AUDIO payload -> the tracks payload (one source's unit of the merged MIDI payload)."""
     def done() -> None:
         if progress is not None:
             progress.update(1)
+        if tqdm_bar is not None:
+            tqdm_bar.update(1)
 
     mono, rate = audio_to_mono(audio)
     src = Audio(mono, rate)
     x16 = src.at(16000)
-    device = wrapper["device"]
+    # Load the whole stage collection onto the run device (ComfyUI's model management
+    # evicts it again when other nodes need the VRAM) and re-sync the wrappers' devices.
+    patcher = wrapper["patcher"]
+    mm.load_model_gpu(patcher)
+    device = patcher.load_device
+    wrapper["device"] = device
+    for stage in (wrapper["transcriber"], wrapper["evidence"], wrapper["grouper"], wrapper["drums"]):
+        if stage is not None:
+            stage.device = torch.device(device)
     chunks = 1
     if wrapper["grouper"] is not None:
         chunks += 1
@@ -314,7 +394,7 @@ def run_transcription(wrapper: dict, audio: dict, progress: ProgressBar | None =
         y = retune.resample(x16, r) if shift else x16
         host = len(y) > HOST_BUF_AFTER_S * 16000 and str(device).startswith("cuda")
         maps, bufs, (smaps, sbufs) = transcriber.run(
-            y, hop_frac=0.25, batch=2, taps=("hidden",), sub_hop_frac=0.5, sub_taps=("hidden", "stem"),
+            y, hop_frac=0.25, batch=batch, taps=("hidden",), sub_hop_frac=0.5, sub_taps=("hidden", "stem"),
             buf_device="cpu" if host else None,
         )
         rep, _, rinfo = evidence.from_run(transcriber, maps, bufs.pop("hidden"))
@@ -342,7 +422,7 @@ def run_transcription(wrapper: dict, audio: dict, progress: ProgressBar | None =
             velocity = conf_vel(rep["score"])
             note_stats = {"transcribed": rinfo["transcribed"], "dropped": rinfo["dropped"], "inserted": rinfo["inserted"]}
         else:
-            maps, _ = transcriber.run(x16)
+            maps, _ = transcriber.run(x16, batch=batch)
             res = transcriber.notes(maps)
             notes3 = np.stack([res["onset"], res["offset"], res["pitch"].astype(np.float64)], 1)
             velocity = conf_vel(res["conf"])
@@ -368,8 +448,7 @@ def run_transcription(wrapper: dict, audio: dict, progress: ProgressBar | None =
             info["tuning_cents"] = None
     note_stats["grouped"] = int(sum(len(t.notes) for t in tracks))
     info["notes"] = note_stats
-    if str(device).startswith("cuda"):
-        torch.cuda.empty_cache()
+    mm.soft_empty_cache()
     done()
 
     drums = wrapper["drums"]
@@ -417,7 +496,9 @@ class DettatoLoader(io.ComfyNode):
                 'on first use; a folder in that directory holding the transcriber subfolder (dettato/, with'
                 'its config.json and model.safetensors) is listed and read from disk instead, and the stage'
                 'nodes read their stage from the same folder. All weights stay small: the full chain is'
-                '28.1 M parameters, 113 MB in fp32, so they run at their released precision.'
+                '28.1 M parameters (113 MB in fp32, about half that in bf16/fp16). The weights ride in RAM'
+                'and occupy the GPU only while a run is in progress - ComfyUI\'s model management evicts'
+                'them when other nodes need the VRAM.'
             ),
             inputs=[
                 io.Combo.Input(
@@ -428,14 +509,21 @@ class DettatoLoader(io.ComfyNode):
                             "on first use. A folder in that directory holding the transcriber subfolder is "
                             "listed here and read from disk instead.",
                 ),
-                io.Combo.Input("device", options=["auto", "cuda", "mps", "cpu"], default="auto"),
+                io.Combo.Input("precision", options=["auto", "bf16", "fp16", "fp32"], default="auto",
+                               tooltip="auto uses ComfyUI's session dtype for auxiliary models (fp16 on CUDA; "
+                                       "fp32 on CPU); bf16/fp16 halve the weight memory; fp32 is the released "
+                                       "precision."),
+                io.Combo.Input("device", options=["auto", "cuda", "mps", "cpu"], default="auto",
+                               tooltip="auto uses ComfyUI's device policy for auxiliary models (honors --gpu-only, "
+                                       "falls back to the CPU on machines without usable VRAM); an explicit "
+                                       "device is used as-is."),
             ],
             outputs=[DETTATO_MODEL.Output(id="model", display_name="model")],
         )
 
     @classmethod
-    def execute(cls, model: str, device: str) -> io.NodeOutput:
-        return io.NodeOutput(load_dettato(model, device))
+    def execute(cls, model: str, precision: str, device: str) -> io.NodeOutput:
+        return io.NodeOutput(load_dettato(model, precision, device))
 
 
 class DettatoStageNode(io.ComfyNode):
@@ -446,6 +534,7 @@ class DettatoStageNode(io.ComfyNode):
 
     STAGE: str | None = None
     DESCRIPTION: str = ""
+    ALIASES: list[str] = []
 
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -453,6 +542,7 @@ class DettatoStageNode(io.ComfyNode):
             node_id=cls.__name__,
             display_name=f"Dettato {cls.STAGE.capitalize()}",
             category=CATEGORY,
+            search_aliases=cls.ALIASES,
             description=cls.DESCRIPTION,
             inputs=[DETTATO_MODEL.Input("model")],
             outputs=[DETTATO_MODEL.Output(id="model", display_name="model")],
@@ -462,14 +552,16 @@ class DettatoStageNode(io.ComfyNode):
     def execute(cls, model: dict) -> io.NodeOutput:
         if model[cls.STAGE] is not None:
             return io.NodeOutput(model)
-        config, state = _load_stage(cls.STAGE, model["name"])
-        model[cls.STAGE] = _build_stage(cls.STAGE, config, state, model["device"])
+        config, state = _load_stage(cls.STAGE, model["name"], model["dtype"])
+        model[cls.STAGE] = _build_stage(cls.STAGE, config, state, model["device"], model["dtype"])
+        model["stages"].attach(cls.STAGE, model[cls.STAGE])
         LOGGER.info("Dettato: attached the %s stage (%s).", cls.STAGE, model["name"])
         return io.NodeOutput(model)
 
 
 class DettatoEvidence(DettatoStageNode):
     STAGE = "evidence"
+    ALIASES = ["evidence", "repair", "note repair", "false notes"]
     DESCRIPTION = (
         'Attach the evidence-repair stage (a 4.9 M note-level transformer) to the Dettato model:'
         "the transcriber's notes are re-checked against its own frame evidence, dropping false"
@@ -480,6 +572,7 @@ class DettatoEvidence(DettatoStageNode):
 
 class DettatoGrouper(DettatoStageNode):
     STAGE = "grouper"
+    ALIASES = ["grouper", "grouping", "instruments", "tracks"]
     DESCRIPTION = (
         'Attach the grouping stage (2.9 M) to the Dettato model: the notes are split into'
         "instrument-named tracks (73 classes, each with a General MIDI program) and the recording's"
@@ -490,6 +583,7 @@ class DettatoGrouper(DettatoStageNode):
 
 class DettatoDrums(DettatoStageNode):
     STAGE = "drums"
+    ALIASES = ["drums", "drum transcription", "drum track"]
     DESCRIPTION = (
         'Attach the drum stage (5.0 M) to the Dettato model: drum kits and orchestral percussion'
         "become a 'Drums' track, timpani written at their pitch. It needs a source recorded at 40"
@@ -508,6 +602,7 @@ class DettatoTranscribe(io.ComfyNode):
             node_id="DettatoTranscribe",
             display_name="Dettato Transcribe to MIDI",
             category="music/Dettato",
+            search_aliases=["transcribe", "transcription", "audio to midi", "stems to midi", "midi"],
             description=(
                 "Transcribe one or more audio sources to a single merged .mid. One slot (audio_0) "
                 "is shown by default and each used slot reveals the next (audio_1, audio_2, ...), "
@@ -587,12 +682,26 @@ class DettatoTranscribe(io.ComfyNode):
                 chunks += 1
         progress = ProgressBar(chunks)
         results = []
-        for label, aud in sources:
-            payload = run_transcription(model, aud, progress)
-            payload = make_tracks_payload(
-                filter_min_velocity(payload["tracks"], min_velocity), payload["seconds"], label, payload["info"]
-            )
-            results.append((label, payload))
+        batch = 2
+        with tqdm(total=chunks, desc="Dettato transcription") as tq:
+            for label, aud in sources:
+                try:
+                    payload = run_transcription(model, aud, progress, batch=batch, tqdm_bar=tq)
+                except torch.OutOfMemoryError:
+                    if batch <= 1:
+                        raise ValueError(
+                            "Dettato: out of GPU memory transcribing "
+                            f"{label!r} even at the lowest batch. Shorten the audio, feed fewer "
+                            "sources at once, pick a lower precision, or set the loader's device to cpu."
+                        )
+                    batch = 1
+                    LOGGER.warning("Dettato: out of memory on %s; retrying at batch 1.", label)
+                    torch.cuda.empty_cache()  # one hard flush: a soft one may free too little after an OOM
+                    payload = run_transcription(model, aud, progress, batch=batch, tqdm_bar=tq)
+                payload = make_tracks_payload(
+                    filter_min_velocity(payload["tracks"], min_velocity), payload["seconds"], label, payload["info"]
+                )
+                results.append((label, payload))
         mm.soft_empty_cache()
         if dedup:
             results, stats = dedup_sources(results)
@@ -614,6 +723,7 @@ class DettatoDedupeMIDI(io.ComfyNode):
             node_id="DettatoDedupeMIDI",
             display_name="Dettato Dedupe MIDI",
             category=CATEGORY,
+            search_aliases=["dedupe", "deduplicate", "duplicates", "stem separation"],
             description=(
                 "Cleans the duplication artifacts of a stem separation: when the same sound is "
                 "transcribed from several stems, the merge shows it once per stem ('Drums' plus "
@@ -655,6 +765,7 @@ class DettatoQuantizeMIDI(io.ComfyNode):
             node_id="DettatoQuantizeMIDI",
             display_name="Dettato Quantize MIDI",
             category=CATEGORY,
+            search_aliases=["quantize", "quantization", "grid", "tempo"],
             description=(
                 "Snaps every note onset to a musical grid defined by the tempo and the grid "
                 "division (1/4, 1/8, 1/16 or 1/32 notes): a note closer to a grid line than to "
@@ -694,6 +805,7 @@ class DettatoPianoRoll(io.ComfyNode):
             node_id="DettatoPianoRoll",
             display_name="Dettato Piano Roll",
             category=CATEGORY,
+            search_aliases=["piano roll", "pianoroll", "score preview", "notes preview"],
             description=(
                 'The piano roll of the transcription: the upper panel is the 88-key range (G7..A0, C rows'
                 'shaded), the lower panel the GM drum keys 27-87; tracks are coloured in track order, drums'
@@ -726,6 +838,7 @@ class DettatoSaveMIDI(io.ComfyNode):
             node_id="DettatoSaveMIDI",
             display_name="Dettato Save MIDI",
             category=CATEGORY,
+            search_aliases=["save midi", "midi export", "write midi", "midi json"],
             description=(
                 "Write the .mid to ComfyUI's output folder as <prefix>_XXXXX.mid - one General MIDI track"
                 'per instrument, named after it, 120 BPM with times in seconds, numbered so runs never'
@@ -757,8 +870,9 @@ class DettatoSaveMIDI(io.ComfyNode):
         path.write_bytes(data)
         n_notes = sum(len(np.asarray(t.notes, np.float64).reshape(-1, 4)) for t in midi["tracks"])
         LOGGER.info("Dettato: wrote %s (%d tracks, %d notes).", path, len(midi["tracks"]), n_notes)
-        # an output node returns no values (None would break ComfyUI's merge_result_data)
-        return io.NodeOutput()
+        # a piano-roll preview on the node (the render defaults keep it compact)
+        preview = render_piano_roll(midi["tracks"], midi["seconds"])
+        return io.NodeOutput(ui=ui.PreviewImage(torch.from_numpy(preview).float()[None].contiguous(), cls=cls))
 
 
 class DettatoInfo(io.ComfyNode):
@@ -770,6 +884,7 @@ class DettatoInfo(io.ComfyNode):
             node_id="DettatoInfo",
             display_name="Dettato Info",
             category=CATEGORY,
+            search_aliases=["info", "summary", "note stats", "transcription info"],
             description=(
                 'The transcription summary as JSON: source, length in seconds, per-track name / General'
                 'MIDI program / is_drum / note count, the note statistics (transcribed, dropped by the'
@@ -795,6 +910,7 @@ class DettatoMIDIToText(io.ComfyNode):
             node_id="DettatoMIDIToText",
             display_name="Dettato MIDI to Text",
             category=CATEGORY,
+            search_aliases=["midi to text", "note names", "score text"],
             description=(
                 "The transcription as generic JSON text: {seconds, tracks: [{name, program, is_drum, "
                 "notes: [[onset s, offset s, pitch, velocity], ...]]}}. Any library that reads JSON can "
@@ -824,6 +940,7 @@ class DettatoToYuE2ABC(io.ComfyNode):
             node_id="DettatoToYuE2ABC",
             display_name="Dettato To YuE2 ABC",
             category=CATEGORY,
+            search_aliases=["yue2", "abc", "score", "adapter", "cover"],
             description=(
                 "Convert the transcription to the native two-voice ABC score that ComfyUI's built-in YuE2"
                 "Generate Music node renders: wire the abc_score output to that node's abc input and YuE2"
@@ -879,6 +996,7 @@ class DettatoSaveABC(io.ComfyNode):
             node_id="DettatoSaveABC",
             display_name="Dettato Save ABC",
             category=CATEGORY,
+            search_aliases=["save abc", "abc score", "write abc"],
             description=(
                 "Write an ABC score to ComfyUI's output folder as <prefix>_XXXXX.abc (e.g. the abc_score"
                 'output of the To YuE2 ABC node), numbered so runs never overwrite each other. Use it to'

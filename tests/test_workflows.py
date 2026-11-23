@@ -8,7 +8,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize("workflow", ["audio2midi", "audio2midi_roformer"])
+@pytest.mark.parametrize("workflow", ["audio2midi", "audio2midi_separated"])
 def test_example_workflow(nodes, workflow):
     data = json.loads((ROOT / "example_workflows" / f"{workflow}.json").read_text())
     by_id = {n["id"]: n for n in data["nodes"]}

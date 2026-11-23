@@ -11,7 +11,6 @@ bf16/fp16), and it runs at whatever precision you pick (the default follows
 ComfyUI's session dtype, with fp32 as the released option). For comparison, the
 next-best open transcriber (MuScriptor) has 1.3 B parameters, and dettato
 outperforms it at about 1/65th the size.
-(MuScriptor) has 1.3 B parameters, and dettato outperforms it at about 1/65th the size.
 
 The pack also drives ComfyUI's built-in YuE2 song generator: the **Dettato To YuE2 ABC** node
 turns a transcription into the ABC score YuE2 renders, so a recording can be re-sung as a
@@ -58,8 +57,8 @@ Load Audio
 - To look at the result, wire the `midi` output to **Dettato Piano Roll** and then to a
   **Preview Image** node.
 
-On an RTX 5060 a 4-minute song takes about 15 seconds; the rest of the practical notes are
-under [Good to know](#good-to-know).
+On a mid-range consumer GPU a 4-minute song takes about 15 seconds; the rest of the practical
+notes are under [Good to know](#good-to-know).
 
 ## How the chain works
 
@@ -102,7 +101,9 @@ Loads the transcriber - the first stage, always on.
   `dettato-grouper/`, `dettato-drums/`, each with `config.json` + `model.safetensors`). It
   must at least hold the transcriber.
 - `precision`: `auto` (ComfyUI's session dtype - fp16 on CUDA, fp32 on CPU), `bf16`,
-  `fp16` (half the weight memory), `fp32` (the released precision).
+  `fp16` (half the weight memory), `fp32` (the released precision). The precision applies to
+  the stage weights; a few constants (the front ends' mel filterbanks and windows, the
+  BatchNorm statistics) and the evidence stage stay fp32 by design.
 - `device`: `auto` (ComfyUI's device policy for auxiliary models - honors `--gpu-only`,
   falls back to the CPU on machines without usable VRAM), `cuda`, `mps`, `cpu`.
 
@@ -135,8 +136,8 @@ the results into one MIDI.
 
 The audio inputs grow as you use them: `audio_0` is shown first, and each connected slot
 reveals the next one (`audio_1`, `audio_2`, ...), up to nine. Any ComfyUI `AUDIO` works -
-**Load Audio**, a video's audio track, or one stem at a time from **Roformer To Audio** (the
-usual separation-to-MIDI path; see [Working with ComfyUI-Roformer](#working-with-comfyui-roformer)).
+**Load Audio**, a video's audio track, or one stem at a time from a separation pack (the usual
+separation-to-MIDI path; see [Working with a separation pack](#working-with-a-separation-pack)).
 
 - `min_velocity`: drops notes quieter than this, per source (1 keeps everything).
 - `dedup`: drops redundant tracks before the merge. When the same instrument was transcribed
@@ -229,12 +230,12 @@ node's `abc` input and YuE2 regenerates the song from the transcribed melody.
   line above G3 that is not a bass; `none` makes the Ins voice rests.
 - `key`: `auto` runs key-finding on the melody, or a standard key such as `Am` or `Db`.
 - `tempo`: `0` fits a grid to the onsets (drum hits weighted double), or a fixed BPM.
+- `meter` (`4/4`, `3/4`, `6/8`, `7/8`) and `grid` (`1/16`, `1/32`) set the bar shape and the
+  note resolution.
 - `octave`: `auto` moves a line by whole octaves into the C4-A#5 window when its middle pitch
   lies outside it - YuE2 sings the octave it is given, and the native cover scores live
   there. An integer `±1..2` transposes both lines. Shifts are pitch-class-neutral, so the key,
   chords and rhythm are untouched.
-- `meter` (`4/4`, `3/4`, `6/8`, `7/8`) and `grid` (`1/16`, `1/32`) set the bar shape and the
-  note resolution.
 - `abc_score` (STRING): the score text, editable in any text editor.
 - `abc_summary` (STRING): JSON with the resolved key and BPM, the chosen tracks, the bar
   count, the number of chord changes and the octave shifts applied.
@@ -245,16 +246,16 @@ Writes an ABC score (e.g. the `abc_score` output above) to the output folder as
 `<prefix>_XXXXX.abc`, numbered per run. Keep it as the symbolic record of the run, or open
 the score, correct a few notes by hand, and feed the edited text to YuE2.
 
-## Working with ComfyUI-Roformer
+## Working with a separation pack
 
-[ComfyUI-Roformer](https://github.com/StanShumsky/ComfyUI-Roformer) separates a recording into
-named stems (vocals, accompaniment, bass, drums, ...); Dettato transcribes them to MIDI. Pick
-each stem with **Roformer To Audio** and wire one into a Transcribe slot - up to nine stems
-land in one file, phase-aligned by construction:
+A separation pack separates a recording into named stems (vocals, accompaniment, bass, drums,
+...); Dettato transcribes them to MIDI. Pick each stem with the pack's stem-to-audio output
+and wire one into a Transcribe slot - up to nine stems land in one file, phase-aligned by
+construction:
 
 ```
-Load Audio -> Roformer Loader -> Roformer Separate
-  -> Roformer To Audio (one per stem you want: vocals, accompaniment, drums, bass, ...)
+Load Audio -> [separation pack: loader + separate]
+  -> [stem to audio, one per stem you want: vocals, accompaniment, drums, bass, ...]
   -> Dettato chain: Loader -> Evidence -> Grouper -> Drums
   -> Dettato Transcribe (one stem per audio slot, up to nine)
   -> Dettato Save MIDI
@@ -297,9 +298,10 @@ Drag into ComfyUI (or use Workflow - Open):
 
 - [audio2midi.json](example_workflows/audio2midi.json) - the plain path: Load Audio - full
   Dettato chain - Transcribe - Piano Roll + Save MIDI.
-- [audio2midi_roformer.json](example_workflows/audio2midi_roformer.json) - the separation
-  path: Load Audio - Roformer Separate - six x Roformer To Audio - Transcribe (dedup on) -
-  Piano Roll + Save MIDI.
+- [audio2midi_separated.json](example_workflows/audio2midi_separated.json) - the separation
+  path: Load Audio - separation pack - six stem outputs - Transcribe (dedup on) - Piano Roll
+  + Save MIDI; the JSON wires a concrete separation pack's nodes, and any other pack's stem
+  outputs can be wired in the same way.
 
 Both need a current ComfyUI for the built-in audio nodes. For a YuE2 cover, extend the graph:
 Transcribe - Dettato To YuE2 ABC - the `abc` input of a built-in YuE2GenerateMusic node (see
@@ -324,8 +326,21 @@ Transcribe - Dettato To YuE2 ABC - the `abc` input of a built-in YuE2GenerateMus
   pass feeds both stages, on the audio retuned to A440 when it sits clearly off. Above about
   4 minutes on a CUDA GPU the pass's intermediate buffers move to host memory, so GPU memory
   stays bounded.
-- Speed: on an RTX 5060 a 4-minute song takes about 15 s and a 6-minute one about 25 s, both
-  peaking under 4 GB. The CPU works but is slow - a 15 s clip took 87 s, including model load.
+- Speed: on a mid-range consumer GPU a 4-minute song takes about 15 s and a 6-minute one
+  about 25 s, both peaking under 4 GB. The CPU works but is slow - a 15 s clip took 87 s,
+  including model load.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest                                 # unit + example-workflow tests: no weights, no network
+RUN_DET_WEIGHTS=1 pytest tests/test_integration.py   # end-to-end on real weights (113 MB once)
+```
+
+The suite runs CPU-only (the ComfyUI modules are stubbed in `tests/conftest.py`). The
+integration tests load the four stage models once into `DET_MODELS_DIR` (default: a temp dir)
+and run on ComfyUI's device selection (CUDA/MPS/CPU).
 
 ## License
 

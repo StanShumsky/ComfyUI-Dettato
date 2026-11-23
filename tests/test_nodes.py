@@ -36,6 +36,27 @@ def test_node_schemas(nodes):
     assert len(categories) == 1  # one menu category for the whole pack
 
 
+def test_tooltips_and_aliases(nodes):
+    """V3 UX baseline (the native geometry packs): hover text on every widget input, search
+    aliases on every node but the loader, is_output_node on exactly the save nodes."""
+    widget_types = {"FLOAT", "RANGEFLOAT", "INT", "BOOLEAN", "COMBO", "STRING", "AUDIO",
+                    "IMAGE", "MASK", "AUTOGROW"}
+    for name, cls in nodes.NODE_CLASS_MAPPINGS.items():
+        schema = cls.define_schema()
+        for inp in schema.inputs:
+            io_type = getattr(type(inp), "io_type", None)
+            if io_type is not None and io_type not in widget_types:
+                continue  # a link input: the hover text travels with the producer's output
+            assert inp.tooltip, (name, inp.id)
+        if name.endswith("Loader"):
+            continue
+        assert schema.search_aliases, name
+    assert {(n, s.is_output_node) for n, c in nodes.NODE_CLASS_MAPPINGS.items()
+            if (s := c.define_schema()).is_output_node} == {
+        ("DettatoSaveMIDI", True), ("DettatoSaveABC", True),
+    }
+
+
 def test_v3_entrypoint_lists_all_nodes(nodes):
     import asyncio
 
@@ -286,6 +307,41 @@ def test_transcriber_weights_are_loaded(nodes, models_dir):
     assert set(loaded) == set(on_disk)
     mismatched = [k for k in on_disk if not torch.equal(loaded[k], on_disk[k].to(loaded[k].dtype))]
     assert not mismatched, f"{len(mismatched)} tensors differ from the file, e.g. {mismatched[:3]}"
+
+
+def test_half_precision_keeps_fp32_islands_fp32(nodes, models_dir):
+    """A half-precision load casts the weights but keeps the fp32 islands fp32: the front
+    end's buffers (HCQT runs its log-mel math in an autocast-disabled block - a half
+    filterbank crashes the STFT matmul on CUDA) and the BatchNorm weights (batch_norm is
+    not an autocast-eligible op and would crash against the fp32 input).
+    (Regression: the loader once cast the whole model with .to(dtype).)"""
+    from dettanode.dettato.transcriber.model import LaneNet
+
+    torch.manual_seed(11)
+    cfg_model = {
+        "c": 368, "depth": 2, "exp": 2, "kt": 3, "dilations": [1, 2], "mid": 16, "t_stride": 2,
+        "attn_at": [], "attn_axes": ["pitch", "time"], "attn_heads": 2,
+        "gru_at": [], "gru_hidden": 8, "gru_bf16": True,
+        "heads": ["onset", "frame", "offset", "onset2", "frame2", "offset2"],
+        "harmonics": [1], "extra_nffts": [], "n_fft": 256, "refine": 1, "n_lanes": 88,
+        "pmix": [-2, -1, 1, 2],
+    }
+    _write_stage(
+        models_dir / "fp16-front", "dettato",
+        {"model": cfg_model, "thresholds": {"on_th": 0.25, "off_th": 0.3, "fr_th": 0.4,
+                                            "fr_low_frames": 2, "on_nms": 3, "v2_th": 0.3}},
+        LaneNet(**cfg_model).state_dict(),
+    )
+    wrapper = nodes.load_dettato("fp16-front", "fp16", "cpu")
+    model = wrapper["transcriber"].model
+    keep_fp32 = nodes._fp32_keys(model)
+    assert keep_fp32  # the mini net has BatchNorm modules and the front end's buffers
+    for name, p in model.named_parameters():
+        want = torch.float32 if name in keep_fp32 else torch.float16
+        assert p.dtype == want, name
+    for name, buf in model.named_buffers():
+        if buf.is_floating_point():
+            assert buf.dtype == torch.float32, name
 
 
 def test_local_collection_without_transcriber_error(nodes, models_dir):

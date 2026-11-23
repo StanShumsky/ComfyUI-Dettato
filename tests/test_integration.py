@@ -36,7 +36,7 @@ def synth_song(t=4.0, rate=48000):
 
 @pytest.fixture(scope="module")
 def wrapper(nodes):
-    (w,) = nodes.DettatoLoader.execute("dettato", "auto").args
+    (w,) = nodes.DettatoLoader.execute("dettato", "auto", "auto").args
     for stage in (nodes.DettatoEvidence, nodes.DettatoGrouper, nodes.DettatoDrums):
         (w,) = stage.execute(w).args
     return w
@@ -54,9 +54,9 @@ def test_transcribe_structure(nodes, transcription):
     assert payload["tracks"] and all(hasattr(t, "notes") for t in payload["tracks"])
     n_notes = sum(len(np.asarray(t.notes, np.float64).reshape(-1, 4)) for t in payload["tracks"])
     assert n_notes >= 1, "a 4 s arpeggio should transcribe to at least one note"
-    drums = payload["info"]["drums"]
+    drums = payload["info"]["drums"]["audio_0"]  # per-source drum decision, keyed by label
     assert isinstance(drums, dict)  # 48 kHz source: the drum stage must have run
-    assert drums["hits"] >= 0
+    assert drums["hits"] >= 0 and "router" in drums
     assert "tuning_cents" in payload["info"]
     data = json.loads(text)
     assert "notes" in data and data["tracks"]

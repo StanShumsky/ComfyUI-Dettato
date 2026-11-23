@@ -1,7 +1,8 @@
 [project]
 name = "comfyui-dettato"
 description = "KobiMusic Dettato multi-instrument audio-to-MIDI nodes: a custom loader for the four 28.1M-parameter stage models (transcriber, evidence repairer, grouper, drums) loaded at their released fp32 precision, plus piano-roll previews, MIDI/JSON writers, and an adapter to the native YuE2 ABC score for ComfyUI's built-in YuE2 song generator."
-version = "0.4.0"
+version = "0.4.1"
+requires-python = ">=3.10"
 license = { file = "LICENSE" }
 dependencies = [
     "huggingface_hub>=1.0",
@@ -31,20 +32,20 @@ requires-comfyui = ">=0.11.0"
 # Registry/manager-side model installation, alongside the in-node auto-download (the subfolder
 # name of each repo matches the stage layout the loader expects).
 [[tool.comfy.Models]]
-location = "dhetto"
-model_url = "https://huggingface.co/kobimusic/dhetto"
+location = "dettato"
+model_url = "https://huggingface.co/kobimusic/dettato"
 
 [[tool.comfy.Models]]
-location = "dhetto"
-model_url = "https://huggingface.co/kobimusic/dhetto-evidence"
+location = "dettato"
+model_url = "https://huggingface.co/kobimusic/dettato-evidence"
 
 [[tool.comfy.Models]]
-location = "dhetto"
-model_url = "https://huggingface.co/kobimusic/dhetto-grouper"
+location = "dettato"
+model_url = "https://huggingface.co/kobimusic/dettato-grouper"
 
 [[tool.comfy.Models]]
-location = "dhetto"
-model_url = "https://huggingface.co/kobimusic/dhetto-drums"
+location = "dettato"
+model_url = "https://huggingface.co/kobimusic/dettato-drums"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

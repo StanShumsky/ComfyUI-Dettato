@@ -92,6 +92,8 @@ def _install_comfy_api_stub() -> None:
             self.node_id, self.display_name, self.category = node_id, display_name, category
             self.description = description
             self.inputs, self.outputs = inputs or [], outputs or []
+            self.search_aliases = kwargs.get("search_aliases") or []
+            self.is_output_node = kwargs.get("is_output_node", False)
             # mirror the real Schema finalization: outputs without ids get default ids
             for i, output in enumerate(self.outputs):
                 if getattr(output, "id", None) is None:
@@ -151,21 +153,52 @@ def _install_stubs() -> None:
 
     comfy = types.ModuleType("comfy")
     mm = types.ModuleType("comfy.model_management")
-    mm.get_torch_device = lambda: torch.device(
-        "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    )
+    # DET_TEST_DEVICE forces the suite onto a specific backend (e.g. cpu on a machine whose
+    # CUDA driver is busy) without touching the ComfyUI device policy the nodes honour.
+    forced = os.environ.get("DET_TEST_DEVICE", "")
+
+    def get_torch_device():
+        if forced:
+            return torch.device(forced)
+        return torch.device(
+            "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+        )
+
+    mm.get_torch_device = get_torch_device
     mm.text_encoder_device = mm.get_torch_device
     mm.text_encoder_offload_device = lambda: torch.device("cpu")
     mm.text_encoder_dtype = lambda device: torch.float16
-    mm.load_model_gpu = lambda patcher: None
+
+    def load_model_gpu(patcher):
+        # Mirror the real model management's full load: everything the patcher owns ends
+        # up on the load device. The real one only partial-loads when the device cannot
+        # hold the model - the nodes detect that themselves and complete the move.
+        patcher.model.to(patcher.load_device)
+        patcher.model.model_loaded_weight_memory = patcher.model_size()
+
+    mm.load_model_gpu = load_model_gpu
     mm.soft_empty_cache = lambda: None
     mp = types.ModuleType("comfy.model_patcher")
 
     class CoreModelPatcher:
+        """The surface the nodes use, with the same bookkeeping the real patcher keeps."""
+
         def __init__(self, model, load_device, offload_device):
             self.model = model
             self.load_device = load_device
             self.offload_device = offload_device
+            self.size = 0
+            if not hasattr(model, "model_loaded_weight_memory"):
+                model.model_loaded_weight_memory = 0
+
+        def model_size(self):
+            if self.size > 0:
+                return self.size
+            self.size = sum(
+                t.numel() * t.element_size()
+                for t in list(self.model.parameters()) + list(self.model.buffers())
+            )
+            return self.size
 
     mp.CoreModelPatcher = CoreModelPatcher
     cu = types.ModuleType("comfy.utils")

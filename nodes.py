@@ -160,19 +160,26 @@ def _download_stage(stage: str, root: Path, force: bool = False) -> Path:
     return target
 
 
-def _load_stage_state(stage_dir: Path, dtype: torch.dtype) -> tuple[dict, dict[str, torch.Tensor]]:
-    """The stage's config and weights read straight into ``dtype`` (no fp32 copy in RAM).
+def _load_stage_config(stage_dir: Path) -> dict:
+    return json.loads((stage_dir / "config.json").read_text())
+
+
+def _load_stage_state(stage_dir: Path, dtype: torch.dtype,
+                      keep_fp32: set[str]) -> dict[str, torch.Tensor]:
+    """The stage's weights read tensor by tensor from the memory map (no fp32 copy in RAM).
 
     The native ComfyUI model loaders build the model in the compute dtype on the offload
-    device; the fp32 file contents are read from the memory map and converted tensor by
-    tensor instead of being resident a second time.
+    device; the fp32 file contents are converted tensor by tensor instead of being resident
+    a second time. The parameters go into ``dtype``; the ``keep_fp32`` keys (the buffers and
+    the BatchNorm weights, see _fp32_keys) keep the file's fp32, and the integer index
+    tensors are not floats at all.
     """
-    config = json.loads((stage_dir / "config.json").read_text())
     state: dict[str, torch.Tensor] = {}
     with safe_open(str(stage_dir / "model.safetensors"), framework="pt") as f:
         for key in f.keys():
-            state[key] = f.get_tensor(key).to(dtype)
-    return config, state
+            t = f.get_tensor(key)
+            state[key] = t if key in keep_fp32 or not t.is_floating_point() else t.to(dtype)
+    return state
 
 
 def _check_weights(state_dict: dict[str, torch.Tensor], name: str) -> None:
@@ -210,7 +217,14 @@ def _load_stage_verified(stage: str, root: Path, allow_download: bool,
             break
         target = _download_stage(stage, root, force=attempt == 1)
         try:
-            config, state = _load_stage_state(target, dtype)
+            config = _load_stage_config(target)
+            # Drums' nets are built from the state dict inside DrumTranscriber itself (their
+            # tensors keep the build dtype), so only the three net stages need the keys.
+            keep_fp32 = set() if stage == "drums" else _fp32_keys(_stage_net(stage, config))
+            # The evidence net runs without autocast (its math is plain fp32), so half
+            # precision would crash its first F.linear; it keeps the released fp32 whatever
+            # the precision option is (19 MB of weights - the saving would be immaterial).
+            state = _load_stage_state(target, torch.float32 if stage == "evidence" else dtype, keep_fp32)
             _check_weights(state, STAGE_DIRS[stage])
             return config, state
         except Exception as error:  # a truncated safetensors raises its own error type
@@ -258,23 +272,60 @@ def _load_stage(stage: str, name: str, dtype: torch.dtype) -> tuple[dict, dict[s
     return _load_stage_verified(stage, root, allow_download=(name == "dettato"), dtype=dtype)
 
 
-def _build_stage(stage: str, config: dict, state: dict[str, torch.Tensor],
-                 device: torch.device, dtype: torch.dtype):
-    """Build one stage's net in the compute dtype on the device (the native pattern: the model
-    is built in the compute dtype, never in fp32)."""
+def _fp32_keys(net: torch.nn.Module) -> set[str]:
+    """The state-dict keys that must keep the file's fp32 even at half precision: all the
+    buffers (the mel filterbanks and STFT windows the front ends run in an autocast-disabled
+    fp32 block, the index tensors, the BatchNorm running stats), plus the BatchNorm
+    weight/bias - batch_norm is not an autocast-eligible op, so under the bf16 autocast the
+    nets run in it executes raw against the fp32 input (conv / linear / layer_norm are all
+    cast on the fly and may take the compute dtype)."""
+    keys = {n for n, _ in net.named_buffers()}
+    for mname, mod in net.named_modules():
+        if isinstance(mod, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d)):
+            for pname, _ in mod.named_parameters(recurse=False):
+                keys.add(f"{mname}.{pname}" if mname else pname)
+    return keys
+
+
+def _stage_net(stage: str, config: dict) -> torch.nn.Module:
+    """The stage's net, fresh in fp32 with nothing loaded (used to derive the buffer keys)."""
+    if stage == "transcriber":
+        return LaneNet(**config["model"])
     if stage == "evidence":
-        model = Repairer(**config["model"]).to(dtype)
-        model.load_state_dict(state, strict=True)
-        return EvidenceRepairer(model, config["keep_th"], config["insert_th"], device)
+        return Repairer(**config["model"])
     if stage == "grouper":
         if config.get("instruments") != INSTRUMENTS:
             raise RuntimeError(
                 f"{STAGE_DIRS[stage]}: the instrument list of the weights does not match this pack; "
                 "the weights are for a different dettato release."
             )
-        model = NoteNet(**config["model"]).to(dtype)
-        model.load_state_dict(state, strict=True)
-        return Grouper(model, config, device)
+        return NoteNet(**config["model"])
+    raise ValueError(f"unknown stage {stage!r}")
+
+
+def _build_net(stage: str, config: dict, state: dict[str, torch.Tensor],
+               dtype: torch.dtype) -> torch.nn.Module:
+    """The stage's net in the compute dtype: the parameters are cast except the BatchNorm
+    weights, and the buffers keep the file's fp32 (see _fp32_keys)."""
+    model = _stage_net(stage, config)
+    keep_fp32 = _fp32_keys(model)
+    for name, p in model.named_parameters():
+        if name not in keep_fp32:
+            p.data = p.data.to(dtype)
+    model.load_state_dict(state, strict=True)
+    return model
+
+
+def _build_stage(stage: str, config: dict, state: dict[str, torch.Tensor],
+                 device: torch.device, dtype: torch.dtype):
+    """Build one stage's net in the compute dtype (the parameters in ``dtype``, the buffers in
+    the file's fp32), on the device."""
+    if stage == "evidence":
+        # Runs without autocast: fp32 whatever the precision option is (see _load_stage_verified).
+        return EvidenceRepairer(_build_net("evidence", config, state, torch.float32),
+                                config["keep_th"], config["insert_th"], device)
+    if stage == "grouper":
+        return Grouper(_build_net("grouper", config, state, dtype), config, device)
     if stage == "drums":
         return DrumTranscriber(config, state, device)
     raise ValueError(f"unknown stage {stage!r}")
@@ -327,8 +378,7 @@ def load_dettato(name: str, precision: str, device: str) -> dict:
         )
     dtype = DTYPES[precision]
     config, state = _load_stage("transcriber", name, dtype)
-    model = LaneNet(**config["model"]).to(dtype)
-    model.load_state_dict(state, strict=True)
+    model = _build_net("transcriber", config, state, dtype)
     transcriber = Transcriber(model, config["thresholds"], offload_device)
     # Build in system RAM and hand the weights to ComfyUI's model management (the native
     # pattern for auxiliary models): the model rides in the offload device until a run loads
@@ -355,6 +405,22 @@ def load_dettato(name: str, precision: str, device: str) -> dict:
 # --------------------------------------------------------------------- transcription
 
 
+def _all_on_device(module, device) -> bool:
+    """True when every parameter and buffer of ``module`` sits on ``device``."""
+    device = torch.device(device)
+    for t in list(module.parameters()) + list(module.buffers()):
+        if t.device != device:
+            return False
+    return True
+
+
+def _is_oom(exc: BaseException) -> bool:
+    """A CUDA OOM, or the RuntimeError wording MPS/XPU use for the same event."""
+    return isinstance(exc, torch.OutOfMemoryError) or (
+        isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+    )
+
+
 def run_transcription(wrapper: dict, audio: dict, progress: ProgressBar | None = None,
                       batch: int = 2, tqdm_bar=None) -> dict:
     """AUDIO payload -> the tracks payload (one source's unit of the merged MIDI payload)."""
@@ -372,6 +438,30 @@ def run_transcription(wrapper: dict, audio: dict, progress: ProgressBar | None =
     patcher = wrapper["patcher"]
     mm.load_model_gpu(patcher)
     device = patcher.load_device
+    stages = wrapper["stages"]
+    if device.type != "cpu" and not _all_on_device(stages, device):
+        # The load was partial: model management's low-VRAM streaming only covers
+        # ComfyUI's own ops, so a plain-torch stage is left with weights split across
+        # the offload device and the GPU, and the first cross-device op crashes (the
+        # transcriber's STFT sees the GPU audio against the CPU hann window). That
+        # happens when the free VRAM is below the stage's size - under pressure, or a
+        # driver reporting less free memory than is really free. Complete the move;
+        # if the device cannot take the whole stage, run this transcription on the
+        # CPU (fp32) instead of OOMing the workflow.
+        try:
+            stages.to(device)
+            patcher.model.model_loaded_weight_memory = patcher.model_size()
+        except RuntimeError as exc:
+            if not _is_oom(exc):
+                raise
+            LOGGER.warning(
+                "Dettato: the full stage does not fit in the free VRAM on %s; "
+                "running this transcription on the CPU (fp32) instead.", device,
+            )
+            stages.to(torch.device("cpu"), dtype=torch.float32)
+            patcher.model.model_loaded_weight_memory = 0
+            patcher.size = 0
+            device = torch.device("cpu")
     wrapper["device"] = device
     for stage in (wrapper["transcriber"], wrapper["evidence"], wrapper["grouper"], wrapper["drums"]):
         if stage is not None:
@@ -629,8 +719,8 @@ class DettatoTranscribe(io.ComfyNode):
                 "off when the sources are different recordings. Outputs: the merged MIDI payload (tracks, length, source "
                 "labels, per-source info, and the .mid rendered once) for the nodes below, and a "
                 "JSON summary. A different stage chain per stem means one Transcribe and one Save "
-                "MIDI per stem. GPU timing: a 4-minute song takes about 15 s on an RTX 5060; the "
-                "CPU works but is roughly 6x slower."
+                "MIDI per stem. GPU timing: a 4-minute song takes about 15 s on a mid-range "
+                "consumer GPU; the CPU works but is roughly 6x slower."
             ),
             inputs=[
                 DETTATO_MODEL.Input("model"),
@@ -687,16 +777,18 @@ class DettatoTranscribe(io.ComfyNode):
             for label, aud in sources:
                 try:
                     payload = run_transcription(model, aud, progress, batch=batch, tqdm_bar=tq)
-                except torch.OutOfMemoryError:
+                except (torch.OutOfMemoryError, RuntimeError) as exc:
+                    if not _is_oom(exc):  # non-OOM errors pass through untouched
+                        raise
                     if batch <= 1:
                         raise ValueError(
                             "Dettato: out of GPU memory transcribing "
                             f"{label!r} even at the lowest batch. Shorten the audio, feed fewer "
                             "sources at once, pick a lower precision, or set the loader's device to cpu."
-                        )
+                        ) from exc
                     batch = 1
                     LOGGER.warning("Dettato: out of memory on %s; retrying at batch 1.", label)
-                    torch.cuda.empty_cache()  # one hard flush: a soft one may free too little after an OOM
+                    mm.soft_empty_cache()  # device-aware cache flush before the retry (CUDA/MPS/XPU)
                     payload = run_transcription(model, aud, progress, batch=batch, tqdm_bar=tq)
                 payload = make_tracks_payload(
                     filter_min_velocity(payload["tracks"], min_velocity), payload["seconds"], label, payload["info"]
@@ -815,9 +907,12 @@ class DettatoPianoRoll(io.ComfyNode):
             ),
             inputs=[
                 DETTATO_PAYLOAD.Input("midi"),
-                io.Float.Input("px_per_ms", default=0.0, min=0.0, max=10.0, step=0.1),
-                io.Int.Input("max_seconds", default=0, min=0, max=36000),
-                io.Boolean.Input("show_drum_panel", default=True),
+                io.Float.Input("px_per_ms", default=0.0, min=0.0, max=10.0, step=0.1,
+                               tooltip="The horizontal scale in px per ms (0 fits the song into about 1400 px)."),
+                io.Int.Input("max_seconds", default=0, min=0, max=36000,
+                             tooltip="Cap the visible length in seconds (0 = the whole song)."),
+                io.Boolean.Input("show_drum_panel", default=True,
+                                 tooltip="Show the GM drum panel (keys 27-87) under the 88-key panel."),
             ],
             outputs=[io.Image.Output(id="piano_roll", display_name="piano_roll")],
         )
@@ -850,7 +945,9 @@ class DettatoSaveMIDI(io.ComfyNode):
             is_output_node=True,
             inputs=[
                 DETTATO_PAYLOAD.Input("midi"),
-                io.String.Input("filename_prefix", default="dettato/midi"),
+                io.String.Input("filename_prefix", default="dettato/midi",
+                                tooltip="The output file name (without extension, subfolders allowed); "
+                                        "runs are numbered so they never overwrite each other."),
             ],
             outputs=[],
         )
@@ -960,14 +1057,30 @@ class DettatoToYuE2ABC(io.ComfyNode):
             ),
             inputs=[
                 DETTATO_PAYLOAD.Input("midi"),
-                io.Combo.Input("mode", options=["melody", "full"], default="melody"),
-                io.String.Input("melody_track", default=""),
-                io.String.Input("ins_track", default=""),
-                io.String.Input("key", default="auto"),
-                io.Int.Input("tempo", default=0, min=0, max=500),
-                io.Combo.Input("meter", options=["4/4", "3/4", "6/8", "7/8"], default="4/4"),
-                io.Combo.Input("grid", options=["1/16", "1/32"], default="1/16"),
-                io.Combo.Input("octave", options=["auto", "-2", "-1", "0", "1", "2"], default="auto"),
+                io.Combo.Input("mode", options=["melody", "full"], default="melody",
+                               tooltip="melody keeps the score chord-free (the cover path: YuE2 keeps your melody "
+                                       "and writes its own accompaniment); full derives chord symbols from the "
+                                       "non-melody tracks."),
+                io.String.Input("melody_track", default="",
+                                tooltip="Exact name of the track to use as the melody (empty picks the most "
+                                        "lead-like pitched track - a voice/vocal track wins, a bass is never "
+                                        "picked)."),
+                io.String.Input("ins_track", default="",
+                                tooltip="A second pitched track for the Ins voice (empty picks the busiest "
+                                        "remaining line above G3 that is not a bass; 'none' = the Ins voice is "
+                                        "rests)."),
+                io.String.Input("key", default="auto",
+                                tooltip="auto runs key-finding on the melody, or a standard key such as 'Am' "
+                                        "or 'Db'."),
+                io.Int.Input("tempo", default=0, min=0, max=500,
+                             tooltip="0 fits a grid to the onsets (drum hits weighted double), or a fixed BPM."),
+                io.Combo.Input("meter", options=["4/4", "3/4", "6/8", "7/8"], default="4/4",
+                               tooltip="Bar shape."),
+                io.Combo.Input("grid", options=["1/16", "1/32"], default="1/16",
+                               tooltip="Note resolution (1/16 or 1/32 notes per beat)."),
+                io.Combo.Input("octave", options=["auto", "-2", "-1", "0", "1", "2"], default="auto",
+                               tooltip="auto moves a line by whole octaves into the C4..A#5 window when its "
+                                       "middle pitch lies outside it; an integer (-2..2) transposes both lines."),
             ],
             outputs=[
                 io.String.Output(id="abc_score", display_name="abc_score"),
@@ -1005,8 +1118,12 @@ class DettatoSaveABC(io.ComfyNode):
             ),
             is_output_node=True,
             inputs=[
-                io.String.Input("abc", default="", multiline=True),
-                io.String.Input("filename_prefix", default="dettato/abc"),
+                io.String.Input("abc", default="", multiline=True,
+                                tooltip="The ABC score text to write (e.g. the abc_score output of the "
+                                        "To YuE2 ABC node)."),
+                io.String.Input("filename_prefix", default="dettato/abc",
+                                tooltip="The output file name (without extension, subfolders allowed); "
+                                        "runs are numbered so they never overwrite each other."),
             ],
             outputs=[],
         )

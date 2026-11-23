@@ -309,6 +309,9 @@ Transcribe - Dettato To YuE2 ABC - the `abc` input of a built-in YuE2GenerateMus
 
 ## Good to know
 
+- The audio inputs need a sample rate: nearly every file has one, but a few (some video
+  files) do not report one for their audio stream - the Transcribe node stops with a clear
+  error instead of guessing; re-saving the audio (e.g. as .wav) fixes it.
 - The output is **performance MIDI**: notes keep the timing of the recording and are not
   quantized to a beat. The **Dettato Quantize MIDI** node snaps them to a `tempo` x `grid`
   grid (note lengths are preserved) when you want the MIDI to sit on the grid, e.g. before

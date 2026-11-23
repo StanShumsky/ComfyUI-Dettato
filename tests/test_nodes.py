@@ -103,6 +103,12 @@ def test_audio_to_mono(nodes, make_audio):
         nodes.audio_to_mono({"waveform": torch.zeros(1, 1, 0), "sample_rate": 16000})
     with pytest.raises(ValueError):
         nodes.audio_to_mono({"waveform": torch.zeros(1, 1, 10), "sample_rate": 0})
+    # a file whose audio stream reports no rate (some video files) once crashed the Transcribe
+    # node with a raw int(None) TypeError - it must be an actionable error
+    with pytest.raises(ValueError, match="no sample rate"):
+        nodes.audio_to_mono({"waveform": torch.zeros(1, 1, 100), "sample_rate": None})
+    with pytest.raises(ValueError, match="not a ComfyUI AUDIO payload"):
+        nodes.audio_to_mono({"sample_rate": 16000})
 
 
 # --------------------------------------------------------------------- piano roll

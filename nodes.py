@@ -754,7 +754,7 @@ class DettatoTranscribe(io.ComfyNode):
         sources = [(name, audios[name]) for name in
                    sorted(audios, key=lambda n: int(n.rsplit("_", 1)[-1]))]
         if model["drums"] is None:
-            eligible = [name for name, aud in sources if int(aud["sample_rate"]) >= MIN_SOURCE_RATE]
+            eligible = [name for name, aud in sources if int(aud.get("sample_rate") or 0) >= MIN_SOURCE_RATE]
             if eligible:
                 LOGGER.warning(
                     "Dettato: no Drums stage in the model chain - %s record(s) at %d+ Hz would "
@@ -764,7 +764,7 @@ class DettatoTranscribe(io.ComfyNode):
                 )
         chunks = 0
         for _, aud in sources:
-            rate = int(aud["sample_rate"])
+            rate = int(aud.get("sample_rate") or 0)  # None-safe; audio_to_mono raises the clean error
             chunks += 1
             if model["grouper"] is not None:
                 chunks += 1

@@ -15,10 +15,21 @@ from .dettato.pipeline import Transcription, Track
 
 def audio_to_mono(audio: dict) -> tuple[np.ndarray, int]:
     """ComfyUI AUDIO {waveform (B, C, N) or (C, N), sample_rate} -> mono float32 numpy and the rate."""
+    if not isinstance(audio, dict) or "waveform" not in audio:
+        raise ValueError(
+            "The audio input is not a ComfyUI AUDIO payload (waveform + sample_rate). Connect a "
+            "Load Audio node or another node's audio output to the slot."
+        )
     waveform = audio["waveform"]
     if not torch.is_tensor(waveform):
         waveform = torch.as_tensor(waveform)
-    rate = int(audio["sample_rate"])
+    rate = audio.get("sample_rate")
+    if rate is None:
+        raise ValueError(
+            "The connected audio has no sample rate: its file's audio stream does not report one "
+            "(some video files do). Re-save the audio (e.g. as .wav) and load that file instead."
+        )
+    rate = int(rate)
     if rate <= 0:
         raise ValueError(f"Audio sample rate must be positive, got {rate}.")
     x = waveform.detach().float()

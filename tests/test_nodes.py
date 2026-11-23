@@ -111,6 +111,18 @@ def test_audio_to_mono(nodes, make_audio):
         nodes.audio_to_mono({"sample_rate": 16000})
 
 
+def test_explicit_device_has_index(nodes):
+    """An explicit run device must carry an index: a bare 'cuda' has .index == None, and
+    ComfyUI's model management (the VBAR pageout path under VRAM pressure) does
+    int(device.index) - that None index was the 'int() argument must be ... not NoneType'
+    crash with the loader's device set to cuda."""
+    cuda = nodes._resolve_load_device("cuda")
+    assert cuda.type == "cuda" and cuda.index is not None
+    assert nodes._resolve_load_device("mps") == torch.device("mps:0")
+    assert nodes._resolve_load_device("cpu") == torch.device("cpu")
+    assert nodes._resolve_load_device("cuda:1") == torch.device("cuda:1")
+
+
 # --------------------------------------------------------------------- piano roll
 
 

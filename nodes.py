@@ -358,6 +358,18 @@ class DettatoStages(torch.nn.Module):
             self.drums_experts = torch.nn.ModuleList(wrapper.experts)
 
 
+def _resolve_load_device(device: str) -> torch.device:
+    """An explicit run device, always with an index: a bare 'cuda'/'mps' has .index == None,
+    and ComfyUI's model management (the VBAR pageout path, used when a model loads under
+    VRAM pressure) does int(device.index) - a None index is the "int() argument must be a
+    string, a bytes-like object or a real number, not 'NoneType'" crash."""
+    if device == "cuda":
+        return torch.device(f"cuda:{mm.get_torch_device().index or 0}")
+    if device == "mps":
+        return torch.device("mps:0")
+    return torch.device(device)
+
+
 def load_dettato(name: str, precision: str, device: str) -> dict:
     """The model payload: the transcriber (always); the optional stages attach via the stage nodes."""
     if device == "auto":
@@ -366,7 +378,7 @@ def load_dettato(name: str, precision: str, device: str) -> dict:
         load_device = mm.text_encoder_device()
         offload_device = mm.text_encoder_offload_device()
     else:
-        load_device = torch.device(device)
+        load_device = _resolve_load_device(device)
         offload_device = torch.device("cpu")
     if precision == "auto":
         # ComfyUI's session dtype for auxiliary models (fp16 on CUDA by default; honors

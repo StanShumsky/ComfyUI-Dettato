@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-dettato"
 description = "KobiMusic Dettato multi-instrument audio-to-MIDI nodes: a custom loader for the four 28.1M-parameter stage models (transcriber, evidence repairer, grouper, drums) loaded at their released fp32 precision, plus piano-roll previews, MIDI/JSON writers, and an adapter to the native YuE2 ABC score for ComfyUI's built-in YuE2 song generator."
-version = "1.0.0"
+version = "1.0.1"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 dependencies = [
@@ -12,10 +12,10 @@ dependencies = [
     "pretty_midi>=0.2",
     "tqdm",
 ]
+# No GPU classifier: the nodes run on whatever accelerator ComfyUI runs on (including CPU).
+# A declared GPU would make ComfyUI-Manager report a platform conflict on CPU setups.
 classifiers = [
     "Operating System :: OS Independent",
-    "Environment :: GPU :: NVIDIA CUDA",
-    "Environment :: GPU :: Apple Metal",
 ]
 
 [project.urls]

@@ -57,7 +57,7 @@ def decode(onset, frame, offset, hop, on_th=0.25, off_th=0.3, fr_th=0.4, fr_low_
         offs = np.nonzero(pk_off[:, l])[0]
         lows = np.nonzero(run[:, l])[0]
         for i, t0 in enumerate(ons):
-            u0 = t0 + _refine(on, t0, l)
+            u0 = max(0.0, t0 + _refine(on, t0, l))
             nxt = ons[i + 1] if i + 1 < len(ons) else T
             j = np.searchsorted(lows, t0 + 1)
             e_fr = lows[j] if j < len(lows) else T

@@ -178,6 +178,7 @@ def _install_stubs() -> None:
 
     mm.load_model_gpu = load_model_gpu
     mm.soft_empty_cache = lambda: None
+    mm.throw_exception_if_processing_interrupted = lambda: None
     mp = types.ModuleType("comfy.model_patcher")
 
     class CoreModelPatcher:

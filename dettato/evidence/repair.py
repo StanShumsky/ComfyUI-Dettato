@@ -5,6 +5,7 @@ import numpy as np
 import torch
 
 from .. import hub
+from ..transcriber import SR
 from .features import N_EV, evidence_from_run, transcribe_with_evidence
 from .model import L_WIN, Repairer
 
@@ -110,7 +111,7 @@ class EvidenceRepairer:
         return cls(model, cfg["keep_th"], cfg["insert_th"], device)
 
     @torch.no_grad()
-    def edits(self, k, ev):
+    def edits(self, k, ev, check=None, duration=None):
         """Per input note: P(keep), repaired onset / end (NaN = its window passed through unchanged); insertion proposals
         [(onset, end, pitch, score)], all in seconds from the start of the recording."""
         n = len(k)
@@ -120,6 +121,8 @@ class EvidenceRepairer:
             return pk, on_r, off_r, ins
         end, on = float(k["off"].max()), k["on"]
         for t0 in np.arange(0, end + L_WIN, L_WIN):
+            if check is not None:
+                check()
             lo, hi = int(np.searchsorted(on, t0)), int(np.searchsorted(on, t0 + L_WIN))
             if hi <= lo or hi - lo > MAX_WIN:
                 continue
@@ -132,10 +135,17 @@ class EvidenceRepairer:
             for i in range(m, len(c)):
                 x = c[i]
                 if x["kind"] != 0 and 0 <= x["on"] < L_WIN:
-                    ins.append((float(x["on"]) + t0, float(x["off"]) + t0, int(x["pitch"]), float(x["score"])))
+                    i_on, i_off = float(x["on"]) + t0, float(x["off"]) + t0
+                    if duration is not None:
+                        if not 0 <= i_on < duration:
+                            continue
+                        i_off = min(i_off, duration)
+                        if i_off <= i_on:
+                            continue
+                    ins.append((i_on, i_off, int(x["pitch"]), float(x["score"])))
         return pk, on_r, off_r, ins
 
-    def apply(self, k, e):
+    def apply(self, k, e, duration=None):
         """Input notes + edits -> the repaired notes (dict of arrays sorted by onset, pitch)."""
         pk, on_r, off_r, ins = e
         has = ~np.isnan(pk)
@@ -150,31 +160,43 @@ class EvidenceRepairer:
         c = np.zeros(len(rows), [("inst", "i2"), ("pitch", "i2"), ("on", "f8"), ("off", "f8"), ("score", "f4"), ("kind", "i1")])
         for i, r in enumerate(rows):
             c[i] = (0, r[2], r[0], r[1], r[3], r[4])
+        if duration is not None:
+            c = c[(c["on"] >= 0) & (c["on"] < duration)]
         if len(c):
             c = c[_safe_dedup_idx(c)]
         on = np.array([round(float(a), 4) for a in c["on"]], np.float64)
-        off = np.array([round(max(float(b), float(a) + 0.01), 4) for a, b in zip(c["on"], c["off"])], np.float64)
+        floor = [float(a) + 0.01 if duration is None else min(float(a) + 0.01, duration) for a in c["on"]]
+        off = np.array([round(max(float(b), f), 4) for b, f in zip(c["off"], floor)], np.float64)
+        if duration is not None:
+            keep = on < duration
+            c, on, off = c[keep], on[keep], np.minimum(off[keep], duration)
         return dict(onset=on, offset=off, pitch=c["pitch"].astype(np.int64), inserted=c["kind"] == 1,
                     score=c["score"].astype(np.float32))
 
-    def _run(self, res, ev):
+    def _run(self, res, ev, check=None, duration=None):
         k, o = input_notes(res)
-        e = self.edits(k, ev[o])
-        rep = self.apply(k, e)
+        e = self.edits(k, ev[o], check=check, duration=duration)
+        rep = self.apply(k, e, duration=duration)
         info = dict(transcribed=len(k), kept=int((~rep["inserted"]).sum()), inserted=int(rep["inserted"].sum()))
         info["dropped"] = info["transcribed"] - info["kept"]
         return rep, res, info
 
-    def __call__(self, transcriber, audio, batch=2):
+    def __call__(self, transcriber, audio, batch=2, check=None):
         """audio: 16 kHz mono float32 -> (repaired notes, transcriber notes, info). Runs the transcriber itself."""
-        res, _, ev = transcribe_with_evidence(transcriber, audio, batch=batch)
-        return self._run(res, ev)
+        res, _, ev = transcribe_with_evidence(transcriber, audio, batch=batch, check=check)
+        return self._run(res, ev, check=check, duration=len(audio) / SR)
 
-    def from_run(self, transcriber, maps, hidden):
+    def from_evidence(self, res, ev, check=None, duration=None):
+        """Repair notes using evidence already gathered by a tap-free maps pass and a bounded hidden-state pass."""
+        return self._run(res, ev, check=check, duration=duration)
+
+    def from_run(self, transcriber, maps, hidden, check=None, duration=None):
         """The same from a transcriber pass already made: its maps and its hidden state (T, 88, 368 float16, on the device or in
         host memory), both averaged over every window (``Transcriber.run(audio, hop_frac=0.25, taps=("hidden",))``)."""
         res, ev = evidence_from_run(transcriber, maps, hidden)
-        return self._run(res, ev)
+        if duration is None:
+            duration = maps["onset"].shape[0] * transcriber.hop
+        return self._run(res, ev, check=check, duration=duration)
 
 
 __all__ = ["EvidenceRepairer", "N_EV"]

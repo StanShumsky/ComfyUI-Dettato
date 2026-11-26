@@ -21,8 +21,7 @@ C_H = 368
 N_MAP = 33
 N_EV = N_MAP + 2 * C_H          # 769
 Q = 32.0
-MAX_S_1PASS = 250.0             # longer recordings: the tap buffers go to host memory (dettato.pipeline), or, in the standalone
-                                # transcribe_with_evidence below, the hidden state is gathered in a second pass (bounded memory)
+MAX_S_1PASS = 250.0             # longer recordings use bounded multi-pass gathering (pipeline and standalone API)
 
 
 def _map_feats(own, other, L, A, B):
@@ -93,7 +92,7 @@ def gather_hidden(H, L, A, B, device, chunk=4):
 
 
 @torch.no_grad()
-def gather_hidden_2pass(transcriber, audio, L, A, B, batch=2, hop_frac=0.25):
+def gather_hidden_2pass(transcriber, audio, L, A, B, batch=2, hop_frac=0.25, check=None):
     """The same two vectors without holding the whole song's hidden state: a second pass over the windows that adds each window's
     weighted share at the notes it touches."""
     device = transcriber.device
@@ -114,7 +113,7 @@ def gather_hidden_2pass(transcriber, audio, L, A, B, batch=2, hop_frac=0.25):
         return at.cpu().numpy(), mean.cpu().numpy()
     Lt, At, Bt = (torch.as_tensor(v, device=device) for v in (L, A, B))
     wsum_t = torch.as_tensor(wsum, device=device)
-    for ss, _, taps in transcriber.windows(audio, hop_frac, batch, taps=("hidden",)):
+    for ss, _, taps in transcriber.windows(audio, hop_frac, batch, taps=("hidden",), check=check):
         H = taps["hidden"][:, :, :, :N_KEYS].float()
         for k, s0 in enumerate(ss):
             g0 = transcriber.frame_offset(s0, g_pad)
@@ -172,18 +171,24 @@ def evidence_from_run(transcriber, maps, H):
     return res, _assemble(mf, at, mean)
 
 
-def transcribe_with_evidence(transcriber, audio, batch=2):
+def evidence_from_maps_2pass(transcriber, audio, maps, batch=2, check=None):
+    """Maps from a tap-free pass -> notes and evidence, gathering hidden states in a second bounded-memory pass."""
+    res, L, A, B, mf = _decode_maps(transcriber, maps)
+    at, mean = gather_hidden_2pass(transcriber, audio, L, A, B, batch, check=check)
+    return res, _assemble(mf, at, mean)
+
+
+def transcribe_with_evidence(transcriber, audio, batch=2, check=None):
     """Run the transcriber (its own pass) and compute every note's evidence.
     -> (notes dict as Transcriber.notes, maps, ev (N, 769) float32 row-aligned with the notes).
-    ``Dettato.transcribe`` does not call this: it runs the transcriber once for the repairer and the grouper together and uses
-    ``evidence_from_run``."""
+    ``Dettato.pitched`` shares one transcriber pass with the grouper below ``MAX_S_1PASS`` and uses bounded passes above it."""
     one_pass = len(audio) <= MAX_S_1PASS * SR
-    maps, buf = transcriber.run(audio, hop_frac=0.25, batch=batch, taps=("hidden",) if one_pass else ())
+    maps, buf = transcriber.run(audio, hop_frac=0.25, batch=batch, taps=("hidden",) if one_pass else (), check=check)
     if one_pass:
         res, ev = evidence_from_run(transcriber, maps, buf.pop("hidden"))
         return res, maps, ev
     res, L, A, B, mf = _decode_maps(transcriber, maps)
-    at, mean = gather_hidden_2pass(transcriber, audio, L, A, B, batch)
+    at, mean = gather_hidden_2pass(transcriber, audio, L, A, B, batch, check=check)
     return res, maps, _assemble(mf, at, mean)
 
 

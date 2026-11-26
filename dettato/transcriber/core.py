@@ -123,7 +123,8 @@ class Transcriber:
     # ------------------------------------------------------------------ windowed pass
     def _layout(self, n, hop_frac):
         W, Fw = int(round(WIN_S * SR)), int(round(WIN_S / self.hop))
-        T = int(math.ceil(n / SR / self.hop))
+        frames = n / SR / self.hop
+        T = int(math.ceil(math.nextafter(frames, -math.inf)))  # exact boundaries can round one ULP above their integer
         step = max(1, int(round(W * hop_frac)))
         pad = W // 2
         starts = list(range(0, n + pad, step))
@@ -135,13 +136,15 @@ class Transcriber:
         return int(round(s0 / SR / self.hop)) - g_pad
 
     @torch.no_grad()
-    def windows(self, audio, hop_frac=0.25, batch=2, taps=(), pad_batch=False):
+    def windows(self, audio, hop_frac=0.25, batch=2, taps=(), pad_batch=False, check=None):
         """Yield (window starts, {head: sigmoid probs (b, Fw, 88)}, {tap: (b, C, Fw, lanes)}) batch by batch.
         pad_batch: fill the last batch with silent windows (one static batch shape)."""
         n = len(audio)
         W, Fw, T, starts, pad, g_pad = self._layout(n, hop_frac)
         x_all = np.concatenate([np.zeros(pad, np.float32), audio.astype(np.float32), np.zeros(pad + W, np.float32)])
         for bi in range(0, len(starts), batch):
+            if check is not None:
+                check()
             ss = starts[bi:bi + batch]
             xs = np.stack([x_all[s0:s0 + W] for s0 in ss])
             if pad_batch and len(ss) < batch:
@@ -154,7 +157,8 @@ class Transcriber:
             yield ss, probs, {k: box[k] for k in taps}
 
     @torch.no_grad()
-    def run(self, audio, hop_frac=0.25, batch=2, taps=(), pad_batch=False, sub_hop_frac=None, sub_taps=(), buf_device=None):
+    def run(self, audio, hop_frac=0.25, batch=2, taps=(), pad_batch=False, sub_hop_frac=None, sub_taps=(), buf_device=None,
+            check=None):
         """-> (maps {head: (T, 88) float32 numpy}, {tap: (T, 88, C) float16 tensor}); with ``sub_hop_frac`` also a third
         element, the same pair for the sub-run (below).
 
@@ -165,10 +169,10 @@ class Transcriber:
             ``hop_frac=sub_hop_frac`` would use, and they are accumulated in the same order, in the same precision and with their
             own weight sum, so the sub-average equals what that separate run returns (up to the batch size the windows ran in).
             It must be a multiple of ``hop_frac``. ``sub_taps`` names the taps it returns (it may hold taps ``taps`` lacks).
-        buf_device: where the float16 tap buffers live (default: the model's device). "cpu" keeps them in host memory so a long
-            recording does not need ~10 MB of GPU memory per second of audio: the windows are added on the device in a sliding
-            ~50 MB working region and each frame is moved to the host once, when no later window can touch it (the result is the
-            same, bit for bit)."""
+        buf_device: where the optional whole-song float16 tap buffers live (default: the model's device). "cpu" keeps them in host
+            memory so a long recording does not need ~10 MB of GPU memory per second of audio: the windows are added on the device in
+            a sliding ~50 MB working region and each frame is moved to the host once, when no later window can touch it (the result is
+            the same, bit for bit). The ComfyUI long-audio pipeline instead avoids these buffers with note-conditioned passes."""
         n = len(audio)
         W, Fw, T, starts, pad, g_pad = self._layout(n, hop_frac)
         w = torch.from_numpy(np.hanning(Fw + 2)[1:-1].astype(np.float32)).to(self.device)
@@ -183,7 +187,7 @@ class Transcriber:
                 raise ValueError("sub_hop_frac must be a multiple of hop_frac")
             sub = _Average(T, self.device, sub_taps, host, cap)
         want = tuple(dict.fromkeys(tuple(taps) + tuple(sub_taps)))
-        for ss, pr, tp in self.windows(audio, hop_frac, batch, want, pad_batch):
+        for ss, pr, tp in self.windows(audio, hop_frac, batch, want, pad_batch, check=check):
             for k, s0 in enumerate(ss):
                 g0 = self.frame_offset(s0, g_pad)
                 a, b = max(0, g0), min(T, g0 + Fw)

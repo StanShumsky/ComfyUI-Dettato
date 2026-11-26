@@ -111,6 +111,25 @@ def test_audio_to_mono(nodes, make_audio):
         nodes.audio_to_mono({"sample_rate": 16000})
 
 
+@pytest.mark.parametrize("shape", [(2, 1, 100), (1, 0, 100), (0, 1, 100), (1, 1, 1, 100), (100,)])
+def test_audio_to_mono_rejects_ambiguous_or_empty_shapes(nodes, shape):
+    with pytest.raises(ValueError):
+        nodes.audio_to_mono({"waveform": torch.zeros(shape), "sample_rate": 16000})
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_audio_to_mono_rejects_nonfinite_samples(nodes, value):
+    waveform = torch.zeros(1, 1, 100)
+    waveform[0, 0, 50] = value
+    with pytest.raises(ValueError, match="finite"):
+        nodes.audio_to_mono({"waveform": waveform, "sample_rate": 16000})
+
+
+def test_audio_to_mono_rejects_complex_samples(nodes):
+    with pytest.raises(ValueError, match="real-valued"):
+        nodes.audio_to_mono({"waveform": torch.zeros(1, 1, 100, dtype=torch.complex64), "sample_rate": 16000})
+
+
 def test_explicit_device_has_index(nodes):
     """An explicit run device must carry an index: a bare 'cuda' has .index == None, and
     ComfyUI's model management (the VBAR pageout path under VRAM pressure) does
@@ -191,6 +210,50 @@ def test_save_midi(nodes, output_dir, make_tracks):
     # second save increments the counter
     nodes.DettatoSaveMIDI.execute(make_tracks(), "unit/midi")
     assert len(list((output_dir / "unit").glob("midi_*.mid"))) == 2
+
+
+def test_save_midi_gaps_and_existing_files_are_not_overwritten(nodes, output_dir, make_tracks):
+    folder = output_dir / "unit"
+    folder.mkdir()
+    (folder / "midi_00000.mid").write_bytes(b"existing")
+    (folder / "midi_00002.mid").write_bytes(b"later")
+    nodes.DettatoSaveMIDI.execute(make_tracks(), "unit/midi")
+    assert (folder / "midi_00000.mid").read_bytes() == b"existing"
+    assert (folder / "midi_00002.mid").read_bytes() == b"later"
+    assert (folder / "midi_00001.mid").is_file()
+
+
+def test_save_midi_concurrent_writers_are_unique(nodes, output_dir):
+    from concurrent.futures import ThreadPoolExecutor
+
+    payloads = [{"tracks": [], "seconds": 1.0, "midi": f"midi-{i}".encode()} for i in range(12)]
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        list(pool.map(lambda p: nodes.DettatoSaveMIDI.execute(p, "concurrent/midi"), payloads))
+    files = list((output_dir / "concurrent").glob("midi_*.mid"))
+    assert len(files) == len(payloads)
+    assert {p.read_bytes() for p in files} == {p["midi"] for p in payloads}
+
+
+def test_save_abc_gap_is_not_overwritten(nodes, output_dir):
+    folder = output_dir / "abc"
+    folder.mkdir()
+    (folder / "score_00000.abc").write_text("existing", encoding="utf-8")
+    (folder / "score_00002.abc").write_text("later", encoding="utf-8")
+    nodes.DettatoSaveABC.execute("first", "abc/score")
+    assert (folder / "score_00000.abc").read_text(encoding="utf-8") == "existing"
+    assert (folder / "score_00002.abc").read_text(encoding="utf-8") == "later"
+    assert (folder / "score_00001.abc").read_text(encoding="utf-8") == "first"
+
+
+def test_save_abc_concurrent_writers_are_unique(nodes, output_dir):
+    from concurrent.futures import ThreadPoolExecutor
+
+    values = [f"X:1\nT:score {i}\nK:C\n" for i in range(12)]
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        list(pool.map(lambda value: nodes.DettatoSaveABC.execute(value, "concurrent-abc/score"), values))
+    files = list((output_dir / "concurrent-abc").glob("score_*.abc"))
+    assert len(files) == len(values)
+    assert {p.read_text(encoding="utf-8") for p in files} == set(values)
 
 
 def test_info(nodes, make_tracks):
@@ -275,12 +338,16 @@ def test_small_collection_load_and_run(nodes, models_dir, make_audio):
     )
 
     wrapper = nodes.load_dettato("small", "fp32", "cpu")
+    transcriber_size = wrapper["patcher"].model_size()
+    assert transcriber_size == wrapper["patcher"].size > 0
     assert wrapper["evidence"] is None and wrapper["grouper"] is None and wrapper["drums"] is None
     # a stage that is not in the collection cannot be attached
     with pytest.raises(FileNotFoundError, match="lacks stage"):
         nodes.DettatoGrouper.execute(wrapper)
     (wrapper,) = nodes.DettatoEvidence.execute(wrapper).args
     assert wrapper["evidence"] is not None and wrapper["grouper"] is None and wrapper["drums"] is None
+    assert wrapper["patcher"].model_size() > transcriber_size
+    assert wrapper["patcher"].size == wrapper["patcher"].model_size()
 
     payload = nodes.run_transcription(wrapper, make_audio(t=1.0, rate=48000, freq=440.0))
     assert payload["seconds"] == pytest.approx(1.0, abs=0.01)
@@ -350,8 +417,8 @@ def test_half_precision_keeps_fp32_islands_fp32(nodes, models_dir):
                                             "fr_low_frames": 2, "on_nms": 3, "v2_th": 0.3}},
         LaneNet(**cfg_model).state_dict(),
     )
-    wrapper = nodes.load_dettato("fp16-front", "fp16", "cpu")
-    model = wrapper["transcriber"].model
+    config, state = nodes._load_stage("transcriber", "fp16-front", torch.float16)
+    model = nodes._build_net("transcriber", config, state, torch.float16)
     keep_fp32 = nodes._fp32_keys(model)
     assert keep_fp32  # the mini net has BatchNorm modules and the front end's buffers
     for name, p in model.named_parameters():
@@ -360,6 +427,32 @@ def test_half_precision_keeps_fp32_islands_fp32(nodes, models_dir):
     for name, buf in model.named_buffers():
         if buf.is_floating_point():
             assert buf.dtype == torch.float32, name
+
+
+@pytest.mark.parametrize("requested", ["fp16", "bf16"])
+def test_cpu_half_precision_falls_back_to_fp32(nodes, models_dir, caplog, requested):
+    from dettanode.dettato.transcriber.model import LaneNet
+
+    torch.manual_seed(12)
+    cfg_model = {
+        "c": 368, "depth": 1, "exp": 2, "kt": 3, "dilations": [1], "mid": 16, "t_stride": 2,
+        "attn_at": [], "attn_axes": ["pitch", "time"], "attn_heads": 2,
+        "gru_at": [], "gru_hidden": 8, "gru_bf16": True,
+        "heads": ["onset", "frame", "offset", "onset2", "frame2", "offset2"],
+        "harmonics": [1], "extra_nffts": [], "n_fft": 256, "refine": 1, "n_lanes": 88,
+        "pmix": [-2, -1, 1, 2],
+    }
+    _write_stage(
+        models_dir / "cpu-half", "dettato",
+        {"model": cfg_model, "thresholds": {"on_th": 0.25, "off_th": 0.3, "fr_th": 0.4, "fr_low_frames": 2, "on_nms": 3, "v2_th": 0.3}},
+        LaneNet(**cfg_model).state_dict(),
+    )
+    wrapper = nodes.load_dettato("cpu-half", requested, "cpu")
+    assert wrapper["dtype"] == torch.float32
+    assert all(p.dtype == torch.float32 for p in wrapper["transcriber"].model.parameters())
+    maps, _ = wrapper["transcriber"].run(np.zeros(1600, np.float32), batch=1)
+    assert maps["onset"].shape[1] == 88
+    assert "CPU" in caplog.text and "fp32" in caplog.text
 
 
 def test_local_collection_without_transcriber_error(nodes, models_dir):

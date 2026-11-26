@@ -81,15 +81,19 @@ class DrumTranscriber:
         return torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=self.device.type == "cuda")
 
     @torch.no_grad()
-    def probabilities(self, feats: np.ndarray) -> dict:
+    def probabilities(self, feats: np.ndarray, check=None) -> dict:
         """(T, 280) features -> router value, the drum-kit model's onset / velocity probabilities and the orchestral models'
         (averaged) drum / timpani / velocity probabilities, all at 50 fps."""
+        if check is not None:
+            check()
         T = feats.shape[0] // 2 * 2
         x = torch.from_numpy(np.ascontiguousarray(feats[:T], dtype=np.float32))[None].to(self.device)
         with self._autocast():
             zk, vk = self.kit(x[..., :160])
         outs = []
         for ex in self.experts:
+            if check is not None:
+                check()
             with self._autocast():
                 o = ex(x)
             base = o["base"][0].float()
@@ -124,9 +128,11 @@ class DrumTranscriber:
         order = np.argsort(on, kind="stable")
         return np.array(on)[order], np.array(ks, np.int64)[order], np.array(vs)[order], "orchestral"
 
-    def transcribe(self, audio: np.ndarray, sr: int = SR) -> list[dict]:
+    def transcribe(self, audio: np.ndarray, sr: int = SR, check=None) -> list[dict]:
         """Mono audio (from a source recorded at >= 40 kHz) -> drum hits sorted by onset. Audio at another rate than 44.1 kHz is
         resampled first."""
+        if check is not None:
+            check()
         x = np.asarray(audio, np.float32)
         if sr != SR:
             import soxr
@@ -135,7 +141,9 @@ class DrumTranscriber:
         if len(x) < SR // 10:
             self.last_info = {"router": None, "model": None}
             return []
-        P = self.probabilities(features(x).astype(np.float32))
+        if check is not None:
+            check()
+        P = self.probabilities(features(x, check=check).astype(np.float32), check=check)
         on, keys, vel, which = self.decode(P)
         self.last_info = {"router": P["router"], "model": which}
         return [{"onset": round(float(a), 4), "offset": round(float(a) + 0.1, 4), "pitch": int(k), "is_drum": True,

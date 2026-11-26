@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import threading
 import warnings
 from contextlib import contextmanager
 
@@ -17,6 +18,7 @@ import numpy as np
 import torch
 
 from .. import hub
+from ..transcriber.core import _Average
 from . import retune
 from .decode import decode
 from .instruments import INSTRUMENTS, K, PROGRAM
@@ -35,6 +37,9 @@ def _autocast(device):
     return torch.autocast("cuda", dtype=torch.bfloat16, enabled=str(device).startswith("cuda"))
 
 
+_DETERMINISTIC_LOCK = threading.RLock()
+
+
 @contextmanager
 def _deterministic(device):
     """On CUDA, use PyTorch's deterministic kernels while the grouper runs: its front end accumulates with scatter_add, whose
@@ -43,14 +48,15 @@ def _deterministic(device):
     if not str(device).startswith("cuda"):
         yield
         return
-    prev, prev_warn = torch.are_deterministic_algorithms_enabled(), torch.is_deterministic_algorithms_warn_only_enabled()
-    torch.use_deterministic_algorithms(True, warn_only=True)
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            yield
-    finally:
-        torch.use_deterministic_algorithms(prev, warn_only=prev_warn)
+    with _DETERMINISTIC_LOCK:
+        prev, prev_warn = torch.are_deterministic_algorithms_enabled(), torch.is_deterministic_algorithms_warn_only_enabled()
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                yield
+        finally:
+            torch.use_deterministic_algorithms(prev, warn_only=prev_warn)
 
 
 # ----------------------------------------------------------------------------- note features from the transcriber
@@ -71,17 +77,12 @@ def assign_slots(notes, tnotes):
 
 
 @torch.no_grad()
-def gather(P, H, S, notes, hop):
-    """Maps P {head: (T, 88)}, hidden state H and stem output S (T, 88, C; on the device or in host memory) at the notes (N, 4) ->
-    meta (N, 12) float32: onset, offset, pitch, slot, onset prob of each voice (max over +-1 frame), frame prob of each voice
-         at the onset and averaged over the note, offset prob of each voice (max over the last frame +-1);
-    feat (N, 3, C) int8 + fsc (N, 3) float16 per-row scales: H at the onset, H over the note (<= 1 s), S over the first 200 ms."""
+def _meta(P, notes, hop):
     dev = P["onset"].device
     T, L = P["onset"].shape
     N = len(notes)
-    Cc = H.shape[2]
     if N == 0:
-        return np.zeros((0, 12), np.float32), np.zeros((0, 3, Cc), np.int8), np.zeros((0, 3), np.float16)
+        return np.zeros((0, 12), np.float32)
     nt = torch.from_numpy(notes).to(dev)
     lane = (nt[:, 2].round().long() - PITCH_LO).clamp(0, L - 1)
     t0 = (nt[:, 0] / hop).round().long().clamp(0, T - 1)
@@ -100,7 +101,26 @@ def gather(P, H, S, notes, hop):
     meta = torch.stack([nt[:, 0].float(), nt[:, 1].float(), nt[:, 2].float(), nt[:, 3].float(),
                         mx3(P["onset"], t0), mx3(P["onset2"], t0), at(P["frame"], t0), at(P["frame2"], t0),
                         span_mean(P["frame"]), span_mean(P["frame2"]), mx3(P["offset"], te - 1), mx3(P["offset2"], te - 1)], 1)
-    meta = meta.cpu().numpy().astype(np.float32)
+    return meta.cpu().numpy().astype(np.float32)
+
+
+@torch.no_grad()
+def gather(P, H, S, notes, hop):
+    """Maps P {head: (T, 88)}, hidden state H and stem output S (T, 88, C; on the device or in host memory) at the notes (N, 4) ->
+    meta (N, 12) float32: onset, offset, pitch, slot, onset prob of each voice (max over +-1 frame), frame prob of each voice
+         at the onset and averaged over the note, offset prob of each voice (max over the last frame +-1);
+    feat (N, 3, C) int8 + fsc (N, 3) float16 per-row scales: H at the onset, H over the note (<= 1 s), S over the first 200 ms."""
+    dev = P["onset"].device
+    T = P["onset"].shape[0]
+    N = len(notes)
+    Cc = H.shape[2]
+    if N == 0:
+        return np.zeros((0, 12), np.float32), np.zeros((0, 3, Cc), np.int8), np.zeros((0, 3), np.float16)
+    nt = torch.from_numpy(notes).to(dev)
+    lane = (nt[:, 2].round().long() - PITCH_LO).clamp(0, H.shape[1] - 1)
+    t0 = (nt[:, 0] / hop).round().long().clamp(0, T - 1)
+    te = torch.maximum((nt[:, 1] / hop).ceil().long(), t0 + 1).clamp(max=T)
+    meta = _meta(P, notes, hop)
 
     def rows(M, t):                 # M[t, lane] on the device, whichever device M lives on
         return M[t.to(M.device), lane.to(M.device)].to(dev)
@@ -220,11 +240,107 @@ class Grouper:
         return cls(model, cfg, device)
 
     # ------------------------------------------------------------------ steps
-    def features(self, y, notes, transcriber):
+    def features(self, y, notes, transcriber, check=None):
         """The transcriber's maps / taps on audio y (its own pass, a window every 4 s), gathered at the notes (N, 3) (already on
         y's time axis). ``group`` does not call this: it takes the same averages from the shared pass (``features_from_run``)."""
-        maps, taps = transcriber.run(y, hop_frac=0.5, batch=4, taps=("hidden", "stem"), pad_batch=True)
+        maps, taps = transcriber.run(y, hop_frac=0.5, batch=4, taps=("hidden", "stem"), pad_batch=True, check=check)
         return self.features_from_run(maps, taps, notes, transcriber)
+
+    @torch.no_grad()
+    def features_streaming(self, y, notes, transcriber, batch=2, check=None):
+        """Grouper features from a bounded pass that retains taps only at frames touched by input notes."""
+        dev = transcriber.device
+        W, Fw, T, starts, _pad, g_pad = transcriber._layout(len(y), 0.25)
+        sub_step = round(W * 0.5)
+        nt_np = assign_slots(notes, np.empty((0, 4), np.float64))
+        t0 = np.rint(nt_np[:, 0] / transcriber.hop).astype(np.int64).clip(0, T - 1)
+        te = np.maximum(np.ceil(nt_np[:, 1] / transcriber.hop).astype(np.int64), t0 + 1).clip(max=T)
+        lane = np.rint(nt_np[:, 2]).astype(np.int64) - PITCH_LO
+        lane = lane.clip(0, N_KEYS - 1)
+
+        def pair_index(cap, onset=False):
+            span = t0[:, None] + np.arange(cap)
+            valid = (span >= 0) & (span < T) & (span < np.minimum(te, t0 + cap)[:, None])
+            times = np.concatenate([t0[:, None], span], 1) if onset else span
+            if onset:
+                valid = np.concatenate([np.ones((len(t0), 1), bool), valid], 1)
+            keys = times * N_KEYS + lane[:, None]
+            unique, inverse = np.unique(keys[valid], return_inverse=True)
+            index = np.full(keys.shape, -1, np.int64)
+            index[valid] = inverse
+            return unique, index
+
+        hkeys, hidx = pair_index(SPAN_CAP, onset=True)
+        skeys, sidx = pair_index(STEM_SPAN)
+        C = transcriber.channels
+        hsum = torch.zeros(len(hkeys), C, dtype=torch.float16, device=dev)
+        ssum = torch.zeros(len(skeys), C, dtype=torch.float16, device=dev)
+        window = torch.from_numpy(np.hanning(Fw + 2)[1:-1].astype(np.float32)).to(dev)
+        wsum = torch.zeros(T, device=dev)
+        for s0 in starts:
+            if s0 % sub_step:
+                continue
+            g0 = transcriber.frame_offset(s0, g_pad)
+            a, b = max(0, g0), min(T, g0 + Fw)
+            if b > a:
+                wsum[a:b] += window[a - g0:b - g0]
+        wsum.clamp_(min=1e-6)
+
+        def add_pairs(total, keys, tap, k, a, b, g0, wt):
+            lo, hi = np.searchsorted(keys, [a * N_KEYS, b * N_KEYS])
+            for q in range(lo, hi, 4096):
+                pairs = keys[q:min(q + 4096, hi)]
+                rel = pairs // N_KEYS - g0
+                lanes = pairs % N_KEYS
+                total[q:q + len(pairs)] += (tap[k][:, rel, lanes].T.float() * wt[rel, None]).half()
+
+        acc = _Average(T, dev, ())
+        for ss, pr, tp in transcriber.windows(y, hop_frac=0.25, batch=batch, taps=("hidden", "stem"), check=check):
+            for k, s0 in enumerate(ss):
+                if s0 % sub_step:
+                    continue
+                g0 = transcriber.frame_offset(s0, g_pad)
+                a, b = max(0, g0), min(T, g0 + Fw)
+                if b <= a:
+                    continue
+                wt = window[a - g0:b - g0]
+                acc.add(a, b, g0, k, wt, pr, None)
+                add_pairs(hsum, hkeys, tp["hidden"], k, a, b, g0, window)
+                add_pairs(ssum, skeys, tp["stem"], k, a, b, g0, window)
+        maps, _ = acc.finish()
+        del acc
+        hsum /= wsum[hkeys // N_KEYS].half()[:, None]
+        ssum /= wsum[skeys // N_KEYS].half()[:, None]
+        tn = transcriber.notes(maps)
+        own = np.stack([tn["onset"], tn["offset"], tn["pitch"].astype(np.float64), tn["slot"] - 1.0], 1).reshape(-1, 4)
+        nt_np = assign_slots(notes, own)
+        P = {name: torch.from_numpy(v).to(dev) for name, v in maps.items()}
+        meta = _meta(P, nt_np, transcriber.hop)
+        mean_h = torch.empty(len(nt_np), C, device=dev)
+        mean_s = torch.empty(len(nt_np), C, device=dev)
+        for q in range(0, len(nt_np), 256):
+            part = slice(q, q + 256)
+            hi_idx = torch.from_numpy(hidx[part, 1:]).to(dev)
+            si_idx = torch.from_numpy(sidx[part]).to(dev)
+            hv = torch.zeros(hi_idx.shape[0], C, device=dev)
+            sv = torch.zeros(si_idx.shape[0], C, device=dev)
+            hc = torch.zeros(hi_idx.shape[0], device=dev)
+            scount = torch.zeros(si_idx.shape[0], device=dev)
+            for j in range(SPAN_CAP):
+                idx = hi_idx[:, j]
+                hv += hsum[idx.clamp(min=0)].float() * (idx >= 0)[:, None]
+                hc += idx >= 0
+            for j in range(STEM_SPAN):
+                idx = si_idx[:, j]
+                sv += ssum[idx.clamp(min=0)].float() * (idx >= 0)[:, None]
+                scount += idx >= 0
+            mean_h[part] = hv / hc.clamp(min=1)[:, None]
+            mean_s[part] = sv / scount.clamp(min=1)[:, None]
+        at_h = hsum[torch.from_numpy(hidx[:, 0]).to(dev)].float()
+        X = torch.stack([at_h, mean_h, mean_s], 1)
+        sc = X.abs().amax(-1).clamp(min=1e-6) / 127.0
+        feat = (X / sc[..., None]).round().clamp(-127, 127).to(torch.int8).cpu().numpy()
+        return meta, feat, sc.cpu().numpy().astype(np.float16)
 
     def features_from_run(self, maps, taps, notes, transcriber):
         """The same from a transcriber pass already made: ``maps`` and ``taps`` {"hidden", "stem"} averaged over the windows that
@@ -238,7 +354,7 @@ class Grouper:
         return out
 
     @torch.no_grad()
-    def predict(self, song: _Song):
+    def predict(self, song: _Song, check=None):
         """-> per-note predictions: probs (n, K), emb (n, E) unit vectors, h (n, d) float16, wins [(t0, sel, emb, probs)]."""
         W, nmax = self.window_s, self.max_notes
         on_all = song.meta[:, 0]
@@ -248,6 +364,8 @@ class Grouper:
         wins = []
         jobs = song_windows(on_all, W, W * self.window_hop, nmax)
         for bi in range(0, len(jobs), self.batch):
+            if check is not None:
+                check()
             chunk = jobs[bi:bi + self.batch]
             items = [song.window(t0, W, sel) or song.window(t0, W, np.concatenate([sel] * 4)[:4]) for t0, sel in chunk]
             batch = collate(items, nmax, self.device)
@@ -276,7 +394,7 @@ class Grouper:
         return dict(probs=(acc / ws[:, None]).astype(np.float32), emb=emb.astype(np.float32), h=h, wins=wins, W=W)
 
     # ------------------------------------------------------------------ all of it
-    def group(self, audio16k: np.ndarray, notes: np.ndarray, transcriber, tuning=None, run=None):
+    def group(self, audio16k: np.ndarray, notes: np.ndarray, transcriber, tuning=None, run=None, check=None, streamed_features=None):
         """audio16k: the recording (16 kHz mono float32); notes (N, 3): onset s, offset s, MIDI pitch (any order), in the
         recording's time axis; transcriber: a dettato.transcriber.Transcriber (its maps and internal states are features).
 
@@ -284,18 +402,26 @@ class Grouper:
         one transcriber pass with the evidence repairer, estimate the tuning first (``retune.ratio``), run the transcriber on the
         retuned audio y, and pass ``tuning`` = that ``retune.ratio`` result and ``run`` = (maps, taps) of the sub-average of that
         pass (``features_from_run``). Then ``audio16k`` is y and ``notes`` are on y's time axis; the tracks come back on the
-        original axis (times x r) either way.
+        original axis (times x r) either way. ``streamed_features`` accepts the output of ``features_streaming`` with ``tuning`` for
+        long recordings whose full-song taps would be too large.
 
         -> (tracks, info). tracks: [{"instrument", "program", "notes": (M, 4) [onset, offset, pitch, velocity 1-127]}], the
         largest first; notes sorted by onset."""
         x = np.asarray(audio16k, np.float32)
         nin = np.array(notes, np.float64).reshape(-1, 3)
-        if run is None:
+        if streamed_features is not None:
+            if tuning is None:
+                raise ValueError("pass the retune.ratio result with precomputed features")
+            delta, strength, shift, r = tuning
+            dur = len(x) * r / SR
+            y = x
+            meta, feat, fsc = streamed_features
+        elif run is None:
             delta, strength, shift, r = retune.ratio(x)
             y = retune.resample(x, r) if shift else x
             nin[:, :2] /= r                                        # onto the retuned time axis
             dur = len(x) / SR
-            meta, feat, fsc = self.features(y, nin, transcriber)
+            meta, feat, fsc = self.features(y, nin, transcriber, check=check)
         else:
             if tuning is None:
                 raise ValueError("pass the retune.ratio result with a precomputed run")
@@ -306,7 +432,7 @@ class Grouper:
         song = _Song(y, meta, feat, fsc)
         on, off, pitch = meta[:, 0].astype(np.float64), meta[:, 1].astype(np.float64), meta[:, 2].round().astype(np.int64)
         conf = np.where(meta[:, 3] > 0.5, meta[:, 5], meta[:, 4])
-        groups = decode(self.predict(song), (on, off, pitch.astype(np.float64)), self.th, **self.params) if len(on) else []
+        groups = decode(self.predict(song, check=check), (on, off, pitch.astype(np.float64)), self.th, **self.params) if len(on) else []
         tracks = self._tracks(on * r, off * r, pitch, conf, groups)
         info = dict(tuning_cents=round(float(delta), 2), tuning_strength=round(float(strength), 3), retune_cents=round(float(shift), 2),
                     retune_ratio=float(r), duration_s=round(dur, 2), notes_in=len(on),

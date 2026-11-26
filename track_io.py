@@ -14,7 +14,7 @@ from .dettato.pipeline import Transcription, Track
 
 
 def audio_to_mono(audio: dict) -> tuple[np.ndarray, int]:
-    """ComfyUI AUDIO {waveform (B, C, N) or (C, N), sample_rate} -> mono float32 numpy and the rate."""
+    """ComfyUI AUDIO {waveform (C, N) or (1, C, N), sample_rate} -> mono float32 numpy and the rate."""
     if not isinstance(audio, dict) or "waveform" not in audio:
         raise ValueError(
             "The audio input is not a ComfyUI AUDIO payload (waveform + sample_rate). Connect a "
@@ -23,6 +23,8 @@ def audio_to_mono(audio: dict) -> tuple[np.ndarray, int]:
     waveform = audio["waveform"]
     if not torch.is_tensor(waveform):
         waveform = torch.as_tensor(waveform)
+    if waveform.is_complex():
+        raise ValueError("Audio waveform must be real-valued; complex audio is not supported.")
     rate = audio.get("sample_rate")
     if rate is None:
         raise ValueError(
@@ -34,12 +36,24 @@ def audio_to_mono(audio: dict) -> tuple[np.ndarray, int]:
         raise ValueError(f"Audio sample rate must be positive, got {rate}.")
     x = waveform.detach().float()
     if x.dim() == 3:
-        x = x[0] if x.shape[0] == 1 else x.mean(0)
+        if x.shape[0] != 1:
+            raise ValueError(
+                "Audio waveform must contain one recording per input; batched waveforms would mix "
+                "different timelines. Connect one audio source to each Dettato audio slot."
+            )
+        x = x[0]
     if x.dim() != 2:
         raise ValueError(f"Audio waveform must be (channels, samples) or (1, channels, samples), got {tuple(x.shape)}.")
+    if x.shape[0] == 0:
+        raise ValueError("The audio has no channels.")
     if x.shape[-1] == 0:
         raise ValueError("The audio is empty.")
-    return x.mean(0).cpu().numpy().astype(np.float32), rate
+    if not torch.isfinite(x).all():
+        raise ValueError("Audio samples must all be finite (no NaN or infinity); check the upstream audio node.")
+    mono = x.mean(0)
+    if not torch.isfinite(mono).all():
+        raise ValueError("The mono audio mix contains non-finite samples; reduce the input amplitude or channel count.")
+    return mono.cpu().numpy().astype(np.float32), rate
 
 
 def make_tracks_payload(tracks: list[Track], seconds: float, source: str, info: dict) -> dict:

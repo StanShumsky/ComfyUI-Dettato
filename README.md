@@ -6,11 +6,9 @@ with vocals - and it writes a MIDI file with one track per instrument. Tracks ar
 73 instrument classes, each with a General MIDI program, plus a `Drums` track covering drum
 kits and orchestral percussion, with timpani written at their pitch.
 
-The whole chain is small: 28.1 M parameters - 113 MB in float32 (about half that in
-bf16/fp16), and it runs at whatever precision you pick (the default follows
-ComfyUI's session dtype, with fp32 as the released option). For comparison, the
-next-best open transcriber (MuScriptor) has 1.3 B parameters, and dettato
-outperforms it at about 1/65th the size.
+The whole chain is small: 28.1 M parameters, 113 MB in float32 (about half that in
+bf16/fp16). For comparison, the next-best open transcriber (MuScriptor) has 1.3 B parameters,
+and dettato outperforms it at about 1/65th the size.
 
 The pack also drives ComfyUI's built-in YuE2 song generator: the **Dettato To YuE2 ABC** node
 turns a transcription into the ABC score YuE2 renders, so a recording can be re-sung as a
@@ -30,7 +28,7 @@ git clone https://github.com/StanShumsky/ComfyUI-Dettato
 pip install -r ComfyUI-Dettato/requirements.txt
 ```
 
-Restart ComfyUI.
+Restart ComfyUI. Use a current ComfyUI build (the pack requires ComfyUI 0.11.0 or newer).
 
 Model weights download from Hugging Face on first use, into `ComfyUI/models/dettato/`
 (transcriber 61 MB, evidence 19 MB, grouper 12 MB, drums 20 MB) - and only for the stages you
@@ -57,8 +55,8 @@ Load Audio
 - To look at the result, wire the `midi` output to **Dettato Piano Roll** and then to a
   **Preview Image** node.
 
-On a mid-range consumer GPU a 4-minute song takes about 15 seconds; the rest of the practical
-notes are under [Good to know](#good-to-know).
+CPU works but is slower than a GPU, and long recordings take noticeably longer and use
+more memory - see [Good to know](#good-to-know) for the practical limits.
 
 ## How the chain works
 
@@ -101,18 +99,16 @@ Loads the transcriber - the first stage, always on.
   `dettato-grouper/`, `dettato-drums/`, each with `config.json` + `model.safetensors`). It
   must at least hold the transcriber.
 - `precision`: `auto` (ComfyUI's session dtype - fp16 on CUDA, fp32 on CPU), `bf16`,
-  `fp16` (half the weight memory), `fp32` (the released precision). The precision applies to
-  the stage weights; a few constants (the front ends' mel filterbanks and windows, the
-  BatchNorm statistics) and the evidence stage stay fp32 by design.
+  `fp16` (half the accelerator weight memory), `fp32` (the released precision). On the
+  CPU the loader always uses fp32 and warns when you ask for otherwise.
 - `device`: `auto` (ComfyUI's device policy for auxiliary models - honors `--gpu-only`,
   falls back to the CPU on machines without usable VRAM), `cuda`, `mps`, `cpu`.
 
+The weights are ComfyUI-managed and may remain resident after a run. ComfyUI evicts them
+when other nodes need the memory, so the chain composes with sampler and separation models.
+A transcription that runs out of memory is retried once at the smallest batch before failing
+with a message that says what to do.
 
-The weights ride in RAM and occupy the GPU only while a run is in progress -
-ComfyUI's model management evicts them when other nodes need the VRAM, so the
-chain composes with sampler and separation models. A transcription that runs
-out of memory is retried once at half the window batch before raising an
-actionable error.
 ### Dettato Evidence
 
 Attaches the evidence stage: the transcriber's notes are re-checked against its own frame
@@ -143,10 +139,10 @@ separation-to-MIDI path; see [Working with a separation pack](#working-with-a-se
 - `dedup`: drops redundant tracks before the merge. When the same instrument was transcribed
   from several stems of one mix, only the stem with the most notes of it is kept. On for a
   separated-stem run, off when the sources are different recordings.
-- The audio is read as mono (the channel average) at the file's own sample rate. The
-  transcriber, repairer and grouper read 16 kHz internally. The drum stage needs a source
-  recorded at **40 kHz or more** (44.1 kHz and 48 kHz files qualify); for slower sources it
-  is skipped, and the reason is in `info_json`.
+- The audio is averaged to mono at the file's own sample rate; the pitched stages read
+  16 kHz internally, and the drum stage needs a source recorded at **40 kHz or more**
+  (44.1 kHz and 48 kHz files qualify). For slower sources the drum stage is skipped, and
+  the reason is in `info_json`.
 - The sources' tracks merge in slot order: the first occurrence of a track name keeps it, and
   a repeat from a later slot is renamed `Name (slot)` - a DAW shows `Piano` and
   `Piano (audio_1)`, `Drums (audio_2)`, and so on. Stems of one recording are length-aligned
@@ -188,10 +184,8 @@ so it slots in anywhere before Save MIDI. The stats land in `info.quantize`; if
 
 ### Dettato Piano Roll
 
-Draws the transcription: the upper panel is the 88-key range (G7..A0, C rows shaded), the
-lower panel the GM drum keys 27-87. Tracks are coloured in track order, drums in red, note
-brightness follows velocity, and a line marks every second. Feed the result to a
-**Preview Image** node.
+Draws the transcription as an image: the 88-key range up top and the GM drum keys below,
+one colour per track, with drums in red. Feed the result to a **Preview Image** node.
 
 - `px_per_ms`: the horizontal scale (0 fits the song into about 1400 px).
 - `max_seconds`: caps the visible length (0 = the whole song).
@@ -270,9 +264,8 @@ per stem, run separate Transcribe and Save MIDI nodes.
 
 YuE2 is a full-song generator built into ComfyUI (v0.36.0 or later): it turns a style prompt,
 lyrics and an optional symbolic score into a complete song with vocals and accompaniment.
-**Dettato To YuE2 ABC** emits the native two-voice ABC dialect YuE2 uses (fixed eight-line
-header, Vocal and Ins blocks of up to four bars, ties across barlines, full-measure `Z`
-rests) - so the score can be inspected, corrected by hand and re-checked before generating:
+**Dettato To YuE2 ABC** emits the native two-voice ABC dialect YuE2 renders - so the score
+can be inspected, corrected by hand and re-checked before generating:
 
 ```
 Load Audio
@@ -325,13 +318,25 @@ Transcribe - Dettato To YuE2 ABC - the `abc` input of a built-in YuE2GenerateMus
 - In 0.3.0 the Transcribe node's output changed from `tracks` (DETTATO_TRACKS) to `midi`
   (DETTATO_MIDI). In a saved workflow, re-plug that one output - every node it feeds accepts
   both types, and legacy payloads still work everywhere.
-- With the evidence and grouper stages both attached, the transcriber runs once: its single
-  pass feeds both stages, on the audio retuned to A440 when it sits clearly off. Above about
-  4 minutes on a CUDA GPU the pass's intermediate buffers move to host memory, so GPU memory
-  stays bounded.
-- Speed: on a mid-range consumer GPU a 4-minute song takes about 15 s and a 6-minute one
-  about 25 s, both peaking under 4 GB. The CPU works but is slow - a 15 s clip took 87 s,
-  including model load.
+
+## Troubleshooting
+
+- **FFmpeg / ffprobe not found:** install FFmpeg and put its `bin` directory on `PATH`. Dettato
+  probes the source sample rate instead of guessing when a container does not report one.
+- **Corrupt or truncated weights:** the loader reports the affected stage and re-fetches it once.
+  For an offline machine, set `DETTATO_WEIGHTS` to a directory containing `dettato/`,
+  `dettato-evidence/`, `dettato-grouper/`, and `dettato-drums/` with their `config.json` and
+  `model.safetensors` files.
+- **Drums missing:** the source must be recorded at 40 kHz or higher. Lower-rate sources still
+  transcribe pitched instruments; the skip reason appears in `info_json`.
+- **CPU with fp16/bf16 selected:** the loader warns and uses fp32. Half-precision CPU weights
+  are not supported.
+- **Out of memory:** the node retries once at the smallest batch window before failing. If it
+  still fails, shorten the source, remove optional stages, or run on the CPU.
+- **Cancellation:** ComfyUI's Stop button is honoured between stages and batches, so a run
+  stops promptly. One long processing step can't be interrupted midway.
+- **Output names:** Save MIDI and Save ABC use exclusive creation and advance to the next free
+  number, so concurrent or repeated runs do not overwrite an earlier file.
 
 ## Tests
 

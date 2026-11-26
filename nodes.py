@@ -38,7 +38,7 @@ from .dettato.grouper import retune
 from .dettato.grouper.core import Grouper
 from .dettato.grouper.instruments import INSTRUMENTS
 from .dettato.grouper.model import NoteNet
-from .dettato.pipeline import MIN_END_S, HOST_BUF_AFTER_S, Track
+from .dettato.pipeline import MIN_END_S, STREAM_AFTER_S, Track, streaming_pitched
 from .dettato.transcriber.core import Transcriber
 from .dettato.transcriber.model import LaneNet
 from .abc_score import tracks_to_abc
@@ -388,6 +388,9 @@ def load_dettato(name: str, precision: str, device: str) -> dict:
             "fp32" if load_device.type == "cpu"
             else "bf16" if mm.text_encoder_dtype(load_device) == torch.bfloat16 else "fp16"
         )
+    elif precision in ("bf16", "fp16") and load_device.type == "cpu":
+        LOGGER.warning("Dettato: %s is not supported on CPU; using fp32 for this model.", precision)
+        precision = "fp32"
     dtype = DTYPES[precision]
     config, state = _load_stage("transcriber", name, dtype)
     model = _build_net("transcriber", config, state, dtype)
@@ -436,12 +439,17 @@ def _is_oom(exc: BaseException) -> bool:
 def run_transcription(wrapper: dict, audio: dict, progress: ProgressBar | None = None,
                       batch: int = 2, tqdm_bar=None) -> dict:
     """AUDIO payload -> the tracks payload (one source's unit of the merged MIDI payload)."""
+    def check() -> None:
+        mm.throw_exception_if_processing_interrupted()
+
     def done() -> None:
         if progress is not None:
             progress.update(1)
         if tqdm_bar is not None:
             tqdm_bar.update(1)
+        check()
 
+    check()
     mono, rate = audio_to_mono(audio)
     src = Audio(mono, rate)
     x16 = src.at(16000)
@@ -449,6 +457,7 @@ def run_transcription(wrapper: dict, audio: dict, progress: ProgressBar | None =
     # evicts it again when other nodes need the VRAM) and re-sync the wrappers' devices.
     patcher = wrapper["patcher"]
     mm.load_model_gpu(patcher)
+    check()
     device = patcher.load_device
     stages = wrapper["stages"]
     if device.type != "cpu" and not _all_on_device(stages, device):
@@ -490,48 +499,59 @@ def run_transcription(wrapper: dict, audio: dict, progress: ProgressBar | None =
     transcriber = wrapper["transcriber"]
     evidence, grouper = wrapper["evidence"], wrapper["grouper"]
     if evidence is not None and grouper is not None:
-        # the upstream path: retune to A440 when clearly off it, then one transcriber pass feeds
-        # both the repairer (every window) and the grouper (every other window)
+        # the upstream path: retune to A440 when clearly off it; short clips share one transcriber pass,
+        # while long clips trade extra passes for bounded note-conditioned tap storage
         delta, strength, shift, r = retune.ratio(x16)
+        check()
         y = retune.resample(x16, r) if shift else x16
-        host = len(y) > HOST_BUF_AFTER_S * 16000 and str(device).startswith("cuda")
-        maps, bufs, (smaps, sbufs) = transcriber.run(
-            y, hop_frac=0.25, batch=batch, taps=("hidden",), sub_hop_frac=0.5, sub_taps=("hidden", "stem"),
-            buf_device="cpu" if host else None,
-        )
-        rep, _, rinfo = evidence.from_run(transcriber, maps, bufs.pop("hidden"))
-        del maps, bufs
-        notes = np.stack(
-            [rep["onset"], np.maximum(rep["offset"], rep["onset"] + MIN_END_S), rep["pitch"].astype(np.float64)], 1
-        )
+        tuning = (delta, strength, shift, r)
+        if len(y) > STREAM_AFTER_S * 16000:
+            rep, _, rinfo, groups, ginfo = streaming_pitched(
+                transcriber, evidence, grouper, y, tuning, batch, check=check, evidence_done=done)
+            tracks = [
+                Track(g["instrument"].replace("_", " "), int(g["program"]), np.asarray(g["notes"], np.float64))
+                for g in groups
+            ]
+        else:
+            maps, bufs, (smaps, sbufs) = transcriber.run(
+                y, hop_frac=0.25, batch=batch, taps=("hidden",), sub_hop_frac=0.5, sub_taps=("hidden", "stem"), check=check,
+            )
+            check()
+            rep, _, rinfo = evidence.from_run(
+                transcriber, maps, bufs.pop("hidden"), check=check, duration=len(y) / 16000)
+            del maps, bufs
+            notes = np.stack(
+                [rep["onset"], np.maximum(rep["offset"], rep["onset"] + MIN_END_S), rep["pitch"].astype(np.float64)], 1
+            )
+            done()
+            groups, ginfo = grouper.group(y, notes, transcriber, tuning=tuning, run=(smaps, sbufs), check=check)
+            del smaps, sbufs
+            tracks = [
+                Track(g["instrument"].replace("_", " "), int(g["program"]), np.asarray(g["notes"], np.float64))
+                for g in groups
+            ]
         done()
-        groups, ginfo = grouper.group(y, notes, transcriber, tuning=(delta, strength, shift, r), run=(smaps, sbufs))
-        del smaps, sbufs
-        tracks = [
-            Track(g["instrument"].replace("_", " "), int(g["program"]), np.asarray(g["notes"], np.float64))
-            for g in groups
-        ]
         info["tuning_cents"] = ginfo.get("tuning_cents")
         note_stats = {"transcribed": rinfo["transcribed"], "dropped": rinfo["dropped"], "inserted": rinfo["inserted"]}
     else:
         # only one of the two (or neither) attached: the transcriber runs its own pass, and the
         # grouper, when present, estimates the tuning and runs its own pass
         if evidence is not None:
-            rep, _, rinfo = evidence(transcriber, x16)
+            rep, _, rinfo = evidence(transcriber, x16, check=check)
             notes3 = np.stack(
                 [rep["onset"], np.maximum(rep["offset"], rep["onset"] + MIN_END_S), rep["pitch"].astype(np.float64)], 1
             )
             velocity = conf_vel(rep["score"])
             note_stats = {"transcribed": rinfo["transcribed"], "dropped": rinfo["dropped"], "inserted": rinfo["inserted"]}
         else:
-            maps, _ = transcriber.run(x16, batch=batch)
+            maps, _ = transcriber.run(x16, batch=batch, check=check)
             res = transcriber.notes(maps)
             notes3 = np.stack([res["onset"], res["offset"], res["pitch"].astype(np.float64)], 1)
             velocity = conf_vel(res["conf"])
             note_stats = {"transcribed": int(len(res["onset"])), "dropped": 0, "inserted": 0}
         done()
         if grouper is not None:
-            groups, ginfo = grouper.group(x16, notes3, transcriber)
+            groups, ginfo = grouper.group(x16, notes3, transcriber, check=check)
             tracks = [
                 Track(g["instrument"].replace("_", " "), int(g["program"]), np.asarray(g["notes"], np.float64))
                 for g in groups
@@ -555,7 +575,7 @@ def run_transcription(wrapper: dict, audio: dict, progress: ProgressBar | None =
 
     drums = wrapper["drums"]
     if drums is not None and rate >= MIN_SOURCE_RATE:
-        hits = drums.transcribe(src.at(44100))
+        hits = drums.transcribe(src.at(44100), check=check)
         if hits:
             drum_notes = np.array(
                 [[h["onset"], h["offset"], h["pitch"], max(1, min(127, int(round(h["velocity"] * 127))))] for h in hits],
@@ -598,9 +618,9 @@ class DettatoLoader(io.ComfyNode):
                 'on first use; a folder in that directory holding the transcriber subfolder (dettato/, with'
                 'its config.json and model.safetensors) is listed and read from disk instead, and the stage'
                 'nodes read their stage from the same folder. All weights stay small: the full chain is'
-                '28.1 M parameters (113 MB in fp32, about half that in bf16/fp16). The weights ride in RAM'
-                'and occupy the GPU only while a run is in progress - ComfyUI\'s model management evicts'
-                'them when other nodes need the VRAM.'
+                '28.1 M parameters (113 MB in fp32, about half that in bf16/fp16). The weights are'
+                'ComfyUI-managed and may remain resident after a run; model management evicts them'
+                'when other nodes need the memory.'
             ),
             inputs=[
                 io.Combo.Input(
@@ -613,8 +633,8 @@ class DettatoLoader(io.ComfyNode):
                 ),
                 io.Combo.Input("precision", options=["auto", "bf16", "fp16", "fp32"], default="auto",
                                tooltip="auto uses ComfyUI's session dtype for auxiliary models (fp16 on CUDA; "
-                                       "fp32 on CPU); bf16/fp16 halve the weight memory; fp32 is the released "
-                                       "precision."),
+                                       "fp32 on CPU); bf16/fp16 halve accelerator weight memory; fp32 is the released "
+                                       "precision. CPU loads always use fp32."),
                 io.Combo.Input("device", options=["auto", "cuda", "mps", "cpu"], default="auto",
                                tooltip="auto uses ComfyUI's device policy for auxiliary models (honors --gpu-only, "
                                        "falls back to the CPU on machines without usable VRAM); an explicit "
@@ -657,6 +677,8 @@ class DettatoStageNode(io.ComfyNode):
         config, state = _load_stage(cls.STAGE, model["name"], model["dtype"])
         model[cls.STAGE] = _build_stage(cls.STAGE, config, state, model["device"], model["dtype"])
         model["stages"].attach(cls.STAGE, model[cls.STAGE])
+        # model_size() is cached; optional stages change the collection's footprint.
+        model["patcher"].size = 0
         LOGGER.info("Dettato: attached the %s stage (%s).", cls.STAGE, model["name"])
         return io.NodeOutput(model)
 
@@ -731,8 +753,8 @@ class DettatoTranscribe(io.ComfyNode):
                 "off when the sources are different recordings. Outputs: the merged MIDI payload (tracks, length, source "
                 "labels, per-source info, and the .mid rendered once) for the nodes below, and a "
                 "JSON summary. A different stage chain per stem means one Transcribe and one Save "
-                "MIDI per stem. GPU timing: a 4-minute song takes about 15 s on a mid-range "
-                "consumer GPU; the CPU works but is roughly 6x slower."
+                "MIDI per stem. CPU timing and long-audio memory measurements are documented in "
+                "AUDIT_REPORT.md; GPU timing varies by device and was not measured in the audit."
             ),
             inputs=[
                 DETTATO_MODEL.Input("model"),
@@ -936,6 +958,17 @@ class DettatoPianoRoll(io.ComfyNode):
         return io.NodeOutput(torch.from_numpy(roll)[None].contiguous())
 
 
+def _write_unique(folder: Path, filename: str, counter: int, suffix: str, data: bytes) -> Path:
+    while True:
+        path = folder / f"{filename}_{counter:05d}{suffix}"
+        try:
+            with path.open("xb") as f:
+                f.write(data)
+            return path
+        except FileExistsError:
+            counter += 1
+
+
 class DettatoSaveMIDI(io.ComfyNode):
     """Write the merged MIDI payload to ComfyUI's output folder."""
 
@@ -969,14 +1002,11 @@ class DettatoSaveMIDI(io.ComfyNode):
         folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
             filename_prefix, folder_paths.get_output_directory(), 1, 1
         )
-        # get_save_image_path counts PNGs only; count our own format to avoid overwrites.
-        counter = len(list(Path(folder).glob(f"{filename}_*.mid")))
-        path = Path(folder) / f"{filename}_{counter:05d}.mid"
         data = midi.get("midi")
         if data is None:
             # a legacy DETTATO_TRACKS payload (bare tracks, no rendered bytes): render it now
             data = render_midi_bytes(midi["tracks"], midi.get("seconds", 0.0))
-        path.write_bytes(data)
+        path = _write_unique(Path(folder), filename, counter, ".mid", data)
         n_notes = sum(len(np.asarray(t.notes, np.float64).reshape(-1, 4)) for t in midi["tracks"])
         LOGGER.info("Dettato: wrote %s (%d tracks, %d notes).", path, len(midi["tracks"]), n_notes)
         # a piano-roll preview on the node (the render defaults keep it compact)
@@ -1145,10 +1175,7 @@ class DettatoSaveABC(io.ComfyNode):
         folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
             filename_prefix, folder_paths.get_output_directory(), 1, 1
         )
-        # get_save_image_path counts PNGs only; count our own format to avoid overwrites.
-        counter = len(list(Path(folder).glob(f"{filename}_*.abc")))
-        path = Path(folder) / f"{filename}_{counter:05d}.abc"
-        path.write_text(abc, encoding="utf-8")
+        path = _write_unique(Path(folder), filename, counter, ".abc", abc.replace("\n", os.linesep).encode("utf-8"))
         LOGGER.info("Dettato: wrote %s (%d chars).", path, len(abc))
         return io.NodeOutput()
 

@@ -10,6 +10,8 @@ The high band is why the model needs a source recorded at 40 kHz or more.
 """
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 import torch
 
@@ -64,20 +66,47 @@ def logfreq_filterbank(sr: int = 16000, n_fft: int = CQ_NFFT, fmin: float = CQ_F
 
 
 _FILTERS: dict[str, torch.Tensor] = {}
+_FILTERS_LOCK = threading.Lock()
 
 
 def _filters(name: str) -> torch.Tensor:
-    if not _FILTERS:
-        _FILTERS["lo"] = torch.from_numpy(mel_filterbank(sr=16000, n_fft=512, n_mels=N_LO, fmin=20.0, fmax=7800.0))
-        _FILTERS["hi"] = torch.from_numpy(mel_filterbank(sr=SR, n_fft=1411, n_mels=N_HI, fmin=7800.0, fmax=20000.0))
-        _FILTERS["cq"] = torch.from_numpy(logfreq_filterbank())
-    return _FILTERS[name]
+    with _FILTERS_LOCK:
+        if not _FILTERS:
+            _FILTERS.update({
+                "lo": torch.from_numpy(mel_filterbank(sr=16000, n_fft=512, n_mels=N_LO, fmin=20.0, fmax=7800.0)),
+                "hi": torch.from_numpy(mel_filterbank(sr=SR, n_fft=1411, n_mels=N_HI, fmin=7800.0, fmax=20000.0)),
+                "cq": torch.from_numpy(logfreq_filterbank()),
+            })
+        return _FILTERS[name]
 
 
-def _logspec(x: np.ndarray, n_fft: int, hop: int, fb: torch.Tensor) -> np.ndarray:
-    s = torch.stft(torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32)), n_fft, hop_length=hop, win_length=n_fft,
-                   window=torch.hann_window(n_fft), center=True, return_complex=True, pad_mode="constant")
-    return torch.log(fb @ (s.abs() ** 2) + FLOOR).T.numpy()
+def _logspec(x: np.ndarray, n_fft: int, hop: int, fb: torch.Tensor, chunk_frames: int = 512,
+             check=None) -> np.ndarray:
+    T = len(x) // hop
+    if T <= 1024:
+        if check is not None:
+            check()
+        s = torch.stft(torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32)), n_fft, hop_length=hop,
+                       win_length=n_fft, window=torch.hann_window(n_fft), center=True, return_complex=True,
+                       pad_mode="constant")
+        return torch.log(fb @ (s.abs() ** 2) + FLOOR).T.numpy()
+    out = np.empty((T, fb.shape[0]), np.float32)
+    left, right = n_fft // 2, n_fft - n_fft // 2
+    window = torch.hann_window(n_fft)
+    for a in range(0, T, chunk_frames):
+        if check is not None:
+            check()
+        b = min(T, a + chunk_frames)
+        # Explicit context reproduces center=True without a whole-song spectrum.
+        s0, s1 = a * hop - left, (b - 1) * hop + right
+        lo, hi = max(0, s0), min(len(x), s1)
+        part = np.zeros(s1 - s0, np.float32)
+        if hi > lo:
+            part[lo - s0:hi - s0] = x[lo:hi]
+        s = torch.stft(torch.from_numpy(part), n_fft, hop_length=hop, win_length=n_fft, window=window,
+                       center=False, return_complex=True)
+        out[a:b] = torch.log(fb @ (s.abs() ** 2) + FLOOR).T.numpy()
+    return out
 
 
 def level_gain(x: np.ndarray) -> float:
@@ -86,15 +115,17 @@ def level_gain(x: np.ndarray) -> float:
     return 10 ** (-18 / 20) / rms
 
 
-def features(x44: np.ndarray) -> np.ndarray:
+def features(x44: np.ndarray, chunk_frames: int = 512, check=None) -> np.ndarray:
     """Mono audio at 44.1 kHz -> (T, 280) float16 features [lo | hi | cq] at 100 frames per second."""
     import soxr
 
+    if check is not None:
+        check()
     x44 = np.asarray(x44, np.float32)
     x = (x44 * level_gain(x44)).astype(np.float32)
     x16 = soxr.resample(x, SR, 16000).astype(np.float32)
-    lo = _logspec(x16, 512, 160, _filters("lo"))
-    hi = _logspec(x, 1411, SR // 100, _filters("hi"))
-    cq = _logspec(x16, CQ_NFFT, 160, _filters("cq"))
+    lo = _logspec(x16, 512, 160, _filters("lo"), chunk_frames, check)
+    hi = _logspec(x, 1411, SR // 100, _filters("hi"), chunk_frames, check)
+    cq = _logspec(x16, CQ_NFFT, 160, _filters("cq"), chunk_frames, check)
     T = min(len(x16) // 160, len(lo), len(hi), len(cq))
     return np.concatenate([lo[:T], hi[:T], cq[:T]], 1).astype(np.float16)

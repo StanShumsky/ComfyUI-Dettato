@@ -1,8 +1,8 @@
 """The whole system: audio file -> instrument-named MIDI tracks + a drum track.
 
     tuning (estimated first; the audio is resampled onto A440 when it sits clearly off it)
-      -> transcriber (notes, two voices per key). ONE network pass over the audio feeds both stages below: every window's output
-         is averaged for the repairer, and every other window's for the grouper's features
+      -> transcriber (notes, two voices per key). One pass feeds both stages on short clips; long clips use bounded note-conditioned
+         passes instead of retaining whole-song hidden/stem tensors
       -> evidence repairer (drops wrong notes, fixes onsets / ends, inserts missed notes, reading the transcriber's own evidence)
       -> grouper (assigns every note to an instrument track and names the track)
     drum model (drum-kit and orchestral percussion hits; only for sources recorded at >= 40 kHz)
@@ -20,11 +20,23 @@ from .evidence.features import MAX_S_1PASS
 from .grouper import retune
 
 MIN_END_S = 0.03            # every pitched note lasts at least 30 ms before grouping
-HOST_BUF_AFTER_S = MAX_S_1PASS   # above this length the transcriber's tap buffers (3 float16 arrays of T x 88 x 368, ~10 MB per
-                                 # second of audio: 2.4 GB at 250 s, 3.5 GB at 6 min) live in host memory instead of on the GPU.
-                                 # Windows are added on the device in a ~50 MB sliding region and every frame is copied out once
-                                 # it is final, so GPU memory stays bounded (a 6-minute song fits the 8 GB card), the cost is
-                                 # a few GB of host RAM and one device-to-host copy, and there is still only one network pass.
+STREAM_AFTER_S = MAX_S_1PASS  # above this length, extra transcriber passes avoid full-song hidden/stem tap buffers
+
+
+def streaming_pitched(transcriber, repairer, grouper, y, tuning, batch=2, check=None, evidence_done=None):
+    """Long-audio pitched stages with note-conditioned tap storage instead of full-song hidden/stem tensors."""
+    from .evidence.features import evidence_from_maps_2pass
+
+    maps, _ = transcriber.run(y, hop_frac=0.25, batch=batch, check=check)
+    res, ev = evidence_from_maps_2pass(transcriber, y, maps, batch, check=check)
+    rep, res, rinfo = repairer.from_evidence(res, ev, check=check, duration=len(y) / 16000)
+    if evidence_done is not None:
+        evidence_done()
+    del maps, ev
+    notes = np.stack([rep["onset"], np.maximum(rep["offset"], rep["onset"] + MIN_END_S), rep["pitch"].astype(np.float64)], 1)
+    streamed = grouper.features_streaming(y, notes, transcriber, batch, check=check)
+    groups, ginfo = grouper.group(y, notes, transcriber, tuning=tuning, streamed_features=streamed, check=check)
+    return rep, res, rinfo, groups, ginfo
 
 
 def default_device() -> str:
@@ -96,22 +108,26 @@ class Dettato:
                    DrumTranscriber.from_pretrained(device), device)
 
     @torch.no_grad()
-    def pitched(self, x, batch: int = 2):
-        """The pitched part of the pipeline on 16 kHz mono audio x: tuning -> one transcriber pass -> evidence repairer -> grouper.
+    def pitched(self, x, batch: int = 2, check=None):
+        """The pitched part of the pipeline on 16 kHz mono audio x: tuning -> transcriber -> evidence repairer -> grouper.
         -> (repaired notes, transcriber notes, repairer info, tracks, grouper info), all times on x's axis."""
         delta, strength, shift, r = retune.ratio(x)
         y = retune.resample(x, r) if shift else x
-        host = len(y) > HOST_BUF_AFTER_S * 16000 and str(self.device).startswith("cuda")
-        # every 2 s: all windows (the repairer: maps + hidden); every 4 s: the windows the grouper reads (maps + hidden + stem)
-        maps, bufs, (smaps, sbufs) = self.transcriber.run(
-            y, hop_frac=0.25, batch=batch, taps=("hidden",), sub_hop_frac=0.5, sub_taps=("hidden", "stem"),
-            buf_device="cpu" if host else None)
-        rep, res, rinfo = self.repairer.from_run(self.transcriber, maps, bufs.pop("hidden"))   # notes on y's time axis
-        del maps, bufs
-        notes = np.stack([rep["onset"], np.maximum(rep["offset"], rep["onset"] + MIN_END_S), rep["pitch"].astype(np.float64)], 1)
-        if str(self.device).startswith("cuda"):
-            torch.cuda.empty_cache()
-        groups, ginfo = self.grouper.group(y, notes, self.transcriber, tuning=(delta, strength, shift, r), run=(smaps, sbufs))
+        tuning = (delta, strength, shift, r)
+        if len(y) > STREAM_AFTER_S * 16000:
+            rep, res, rinfo, groups, ginfo = streaming_pitched(
+                self.transcriber, self.repairer, self.grouper, y, tuning, batch, check=check)
+        else:
+            # every 2 s: all windows (the repairer: maps + hidden); every 4 s: the windows the grouper reads (maps + hidden + stem)
+            maps, bufs, (smaps, sbufs) = self.transcriber.run(
+                y, hop_frac=0.25, batch=batch, taps=("hidden",), sub_hop_frac=0.5, sub_taps=("hidden", "stem"), check=check)
+            rep, res, rinfo = self.repairer.from_run(
+                self.transcriber, maps, bufs.pop("hidden"), check=check, duration=len(y) / 16000)
+            del maps, bufs
+            notes = np.stack([rep["onset"], np.maximum(rep["offset"], rep["onset"] + MIN_END_S), rep["pitch"].astype(np.float64)], 1)
+            if str(self.device).startswith("cuda"):
+                torch.cuda.empty_cache()
+            groups, ginfo = self.grouper.group(y, notes, self.transcriber, tuning=tuning, run=(smaps, sbufs), check=check)
         if r != 1.0:                                    # the groups come back on x's axis already; so do these two
             rep, res = ({**d, "onset": d["onset"] * r, "offset": d["offset"] * r} for d in (rep, res))
         return rep, res, rinfo, groups, ginfo

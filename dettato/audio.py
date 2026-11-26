@@ -32,19 +32,32 @@ class Audio:
 
 
 def _ffmpeg(path: str) -> Audio:
-    rate = _probe_rate(path) or 44100
+    rate = _probe_rate(path)
     raw = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-f", "f32le", "-ac", "1", "-ar", str(rate), "-"],
                          capture_output=True, check=True).stdout
     return Audio(np.frombuffer(raw, np.float32).copy(), rate)
 
 
-def _probe_rate(path: str) -> int | None:
+def _probe_rate(path: str) -> int:
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=sample_rate",
+           "-of", "csv=p=0", path]
     try:
-        out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=sample_rate",
-                              "-of", "csv=p=0", path], capture_output=True, text=True, check=True).stdout
-        return int(out.strip().split(",")[0].split()[0])
-    except Exception:  # noqa: BLE001
-        return None
+        out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+    except FileNotFoundError as exc:
+        raise RuntimeError("ffprobe was not found. Install FFmpeg and ensure its bin directory is on PATH.") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or "").strip()
+        message = f"ffprobe could not determine the audio sample rate for {path!r}."
+        if detail:
+            message += f" {detail}."
+        raise RuntimeError(message + " Check the source file and the FFmpeg installation.") from exc
+    try:
+        rate = int(out.strip().split(",")[0].split()[0])
+    except (ValueError, IndexError) as exc:
+        raise RuntimeError(f"ffprobe did not report an audio sample rate for {path!r}.") from exc
+    if rate <= 0:
+        raise RuntimeError(f"ffprobe reported an invalid audio sample rate for {path!r}: {rate}.")
+    return rate
 
 
 def load(path: str) -> Audio:

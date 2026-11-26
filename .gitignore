@@ -10,3 +10,5 @@ npm-cache/
 *.egg-info/
 dist/
 build/
+.ruff_cache
+benchmarks/
